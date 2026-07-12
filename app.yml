@@ -1,0 +1,1 @@
+command: ["uvicorn", "permissions_app.backend.app:app", "--workers", "2"]

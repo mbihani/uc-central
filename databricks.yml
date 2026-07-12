@@ -1,0 +1,30 @@
+bundle:
+  name: "permissions-app"
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: uv run apx build
+
+resources:
+  apps:
+    permissions-app-app:
+      name: "permissions-app"
+      description: "permissions-app created with apx"
+      source_code_path: ./.build
+
+
+
+
+
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://fevm-stable-classic-7ppxjq.cloud.databricks.com
+      profile: fevm-stable
