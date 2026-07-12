@@ -1,4 +1,5 @@
 import { Suspense, useMemo, useState } from "react";
+import { ErrorBoundary } from "react-error-boundary";
 import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { useCurrentUserSuspense } from "@/lib/api";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -128,10 +129,31 @@ function SidebarUserFooterContent() {
   );
 }
 
-export default function SidebarUserFooter() {
+function SidebarUserFooterFallback() {
   return (
-    <Suspense fallback={<SidebarUserFooterSkeleton />}>
-      <SidebarUserFooterContent />
-    </Suspense>
+    <SidebarMenuButton size="lg">
+      <Avatar className="h-8 w-8 rounded-lg grayscale">
+        <AvatarFallback className="rounded-lg">?</AvatarFallback>
+      </Avatar>
+      <div className="grid flex-1 text-left text-sm leading-tight">
+        <span className="truncate font-medium">Account</span>
+        <span className="text-muted-foreground truncate text-xs">
+          Sign-in unavailable
+        </span>
+      </div>
+    </SidebarMenuButton>
+  );
+}
+
+export default function SidebarUserFooter() {
+  // Isolate the footer's user lookup: if /current-user transiently fails, show a
+  // graceful fallback instead of letting the thrown error bubble to the root
+  // router boundary (which renders a non-recoverable "Something went wrong").
+  return (
+    <ErrorBoundary fallbackRender={() => <SidebarUserFooterFallback />}>
+      <Suspense fallback={<SidebarUserFooterSkeleton />}>
+        <SidebarUserFooterContent />
+      </Suspense>
+    </ErrorBoundary>
   );
 }
