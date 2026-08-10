@@ -1,6 +1,10 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { Suspense, useState, useMemo, Fragment } from "react";
-import { QueryErrorResetBoundary, useQueryClient } from "@tanstack/react-query";
+import {
+  QueryErrorResetBoundary,
+  useQueryClient,
+  useMutation,
+} from "@tanstack/react-query";
 import { ErrorBoundary } from "react-error-boundary";
 import {
   useGetPermissionMatrixSuspense,
@@ -8,11 +12,13 @@ import {
   useUpdatePermissionMatrix,
   useApplyPermissions,
   useCheckPermissionConflicts,
+  previewApplyPermissions,
   checkPermissionConflictsKey,
   getPermissionMatrixKey,
   PermissionLevel,
   type ResourceType,
   type UserPermissionConflict,
+  type ApplyPreviewOut,
 } from "@/lib/api";
 import selector from "@/lib/selector";
 import {
@@ -143,6 +149,20 @@ function getPermissionLabel(level: string): string {
   return level.replace(/_/g, " ");
 }
 
+// Human-readable reason a resource type is skipped by the apply dry-run plan.
+function skipReasonLabel(reason: string): string {
+  switch (reason) {
+    case "no_permissions":
+      return "no permission set";
+    case "unsupported":
+      return "not supported by Apply";
+    case "invalid_level":
+      return "invalid level — fix the matrix";
+    default:
+      return reason;
+  }
+}
+
 function ConflictUserRow({ conflict }: { conflict: UserPermissionConflict }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -252,8 +272,27 @@ function PermissionsContent() {
   const queryClient = useQueryClient();
   const [applyingPersona, setApplyingPersona] = useState<string | null>(null);
   const [confirmPersona, setConfirmPersona] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<ApplyPreviewOut | null>(null);
+  const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set());
   const [showConflictsDialog, setShowConflictsDialog] = useState(false);
   const { isAdmin } = useAdmin();
+
+  // DRY-RUN preview: computes the blast radius (per-type counts) with ZERO ACL
+  // writes. Triggered on the Apply click; its result drives the confirmation
+  // modal. Only on explicit confirm is the REAL (scoped) apply fired.
+  const previewApply = useMutation({
+    mutationFn: (persona: string) => previewApplyPermissions({ persona }),
+    onSuccess: (result) => {
+      const data = result.data;
+      setPreviewData(data);
+      // Default: every plannable type is selected (full apply). The admin can
+      // deselect types to shrink the blast radius before confirming.
+      setSelectedTypes(new Set(data.plan.map((p) => p.resource_type)));
+    },
+    onError: (error) => {
+      toast.error(`Failed to compute preview: ${error.message}`);
+    },
+  });
 
   // Conflict detection query - not suspense, loads in background
   const conflictsQuery = useCheckPermissionConflicts({
@@ -285,13 +324,17 @@ function PermissionsContent() {
       onSuccess: (result) => {
         const data = result.data;
         setApplyingPersona(null);
+        const directPart =
+          data.direct_users_synced && data.direct_users_synced > 0
+            ? `; ${data.direct_users_synced} direct user${data.direct_users_synced !== 1 ? "s" : ""} also re-synced`
+            : "";
         if (data.total_errors > 0) {
           toast.warning(
-            `Applied to ${data.total_resources_updated} resources with ${data.total_errors} errors`,
+            `Applied to ${data.total_resources_updated} resources with ${data.total_errors} errors${directPart}`,
           );
         } else {
           toast.success(
-            `Successfully applied permissions to ${data.total_resources_updated} resources`,
+            `Applied to ${data.total_resources_updated} resources${directPart}`,
           );
         }
       },
@@ -325,23 +368,11 @@ function PermissionsContent() {
     return matrixMap.get(`${persona}::${resourceType}`) || PermissionLevel.NO_PERMISSIONS;
   };
 
-  // Build persona has-groups map
+  // Build persona has-groups map (gates the Apply button)
   const personaHasGroups = new Map<string, boolean>();
-  const personaGroupCount = new Map<string, number>();
   for (const p of personas) {
     personaHasGroups.set(p.persona, p.groups.length > 0);
-    personaGroupCount.set(p.persona, p.groups.length);
   }
-
-  // Build a summary of permissions for the confirmation dialog
-  const confirmPermissions = useMemo(() => {
-    if (!confirmPersona) return [];
-    return matrix.resource_types.map((rt) => ({
-      resourceType: rt,
-      resourceTypeLabel: matrix.resource_type_labels[rt],
-      permissionLevel: getPermLevel(confirmPersona, rt),
-    }));
-  }, [confirmPersona, matrix.resource_types, matrix.resource_type_labels, matrixMap]);
 
   // Count conflicts relevant to the persona being confirmed
   const confirmConflictCount = useMemo(() => {
@@ -352,17 +383,53 @@ function PermissionsContent() {
     ).length;
   }, [confirmPersona, conflicts, matrix.persona_labels]);
 
-  const handleApplyClick = (persona: string) => {
-    setConfirmPersona(persona);
+  // How many workspace resources the CURRENTLY-SELECTED types would rewrite.
+  const selectedResourceCount = useMemo(() => {
+    if (!previewData) return 0;
+    return previewData.plan
+      .filter((p) => selectedTypes.has(p.resource_type))
+      .reduce((sum, p) => sum + p.resource_count, 0);
+  }, [previewData, selectedTypes]);
+
+  const closeConfirm = () => {
+    setConfirmPersona(null);
+    setPreviewData(null);
+    setSelectedTypes(new Set());
+    previewApply.reset();
   };
 
+  const toggleType = (resourceType: string) => {
+    setSelectedTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(resourceType)) {
+        next.delete(resourceType);
+      } else {
+        next.add(resourceType);
+      }
+      return next;
+    });
+  };
+
+  // Step 1 of the guarded Apply: open the modal and compute the dry-run preview.
+  // NOTHING is written here.
+  const handleApplyClick = (persona: string) => {
+    setConfirmPersona(persona);
+    setPreviewData(null);
+    setSelectedTypes(new Set());
+    previewApply.reset();
+    previewApply.mutate(persona);
+  };
+
+  // Step 2: only after the admin confirms do we fire the REAL apply, scoped to
+  // exactly the resource types still selected in the modal.
   const handleConfirmApply = () => {
-    if (!confirmPersona) return;
+    if (!confirmPersona || !previewData || selectedTypes.size === 0) return;
     setApplyingPersona(confirmPersona);
     applyPerms.mutate({
       params: { persona: confirmPersona },
+      data: { resource_types: Array.from(selectedTypes) },
     });
-    setConfirmPersona(null);
+    closeConfirm();
   };
 
   return (
@@ -541,6 +608,7 @@ function PermissionsContent() {
                               className="h-6 text-xs px-2"
                               disabled={
                                 applyPerms.isPending ||
+                                previewApply.isPending ||
                                 !personaHasGroups.get(p)
                               }
                               onClick={() => handleApplyClick(p)}
@@ -549,6 +617,12 @@ function PermissionsContent() {
                                 <>
                                   <Loader2 className="h-3 w-3 animate-spin mr-1" />
                                   Applying...
+                                </>
+                              ) : previewApply.isPending &&
+                                confirmPersona === p ? (
+                                <>
+                                  <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                                  Preview...
                                 </>
                               ) : (
                                 <>
@@ -681,11 +755,11 @@ function PermissionsContent() {
         </CardContent>
       </Card>
 
-      {/* Confirmation Dialog */}
+      {/* Confirmation Dialog — dry-run preview + per-type scoping */}
       <AlertDialog
         open={confirmPersona !== null}
         onOpenChange={(open) => {
-          if (!open) setConfirmPersona(null);
+          if (!open) closeConfirm();
         }}
       >
         <AlertDialogContent className="max-w-lg">
@@ -693,80 +767,162 @@ function PermissionsContent() {
             <AlertDialogTitle className="flex items-center gap-2">
               <Shield className="h-5 w-5" />
               Apply Permissions for{" "}
-              {confirmPersona
-                ? matrix.persona_labels[confirmPersona]
-                : ""}
-              ?
+              {confirmPersona ? matrix.persona_labels[confirmPersona] : ""}?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              This will push the following permission levels to all workspace
-              resources mapped to the{" "}
-              <span className="font-medium text-foreground">
-                {confirmPersona
-                  ? matrix.persona_labels[confirmPersona]
-                  : ""}
-              </span>{" "}
-              persona ({personaGroupCount.get(confirmPersona ?? "") ?? 0}{" "}
-              group
-              {(personaGroupCount.get(confirmPersona ?? "") ?? 0) !== 1
-                ? "s"
-                : ""}
-              ). This action will overwrite existing permissions on those
-              resources.
+              This <span className="font-medium text-foreground">rewrites ACLs
+              across the workspace</span> for the resource types you select
+              below. Every matching resource has this persona's group
+              {previewData && previewData.group_count !== 1 ? "s" : ""}{" "}
+              {previewData ? (
+                <span className="font-medium text-foreground">
+                  ({previewData.groups.join(", ")})
+                </span>
+              ) : null}{" "}
+              set to the persona's level. Deselect any type you do not want to
+              change. Nothing is written until you confirm.
             </AlertDialogDescription>
           </AlertDialogHeader>
 
-          {confirmConflictCount > 0 && (
-            <Alert className="border-amber-500/50 bg-amber-500/5">
-              <AlertTriangle className="h-4 w-4 text-amber-600" />
-              <AlertTitle className="text-sm text-amber-700 dark:text-amber-400">
-                {confirmConflictCount} user{confirmConflictCount !== 1 ? "s" : ""} with
-                cross-persona conflicts
+          {/* Loading state — dry-run preview in flight (no writes) */}
+          {previewApply.isPending && (
+            <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Computing blast radius (dry run — no changes made)...
+            </div>
+          )}
+
+          {/* Error state */}
+          {previewApply.isError && !previewApply.isPending && (
+            <Alert className="border-destructive/50 bg-destructive/5">
+              <AlertCircle className="h-4 w-4 text-destructive" />
+              <AlertTitle className="text-sm text-destructive">
+                Could not compute preview
               </AlertTitle>
               <AlertDescription className="text-xs">
-                Some users in this persona's groups also belong to groups with
-                higher permissions from other personas. Conflicts will be
-                auto-resolved to the highest permission level.
+                {previewApply.error?.message ??
+                  "The dry-run preview failed. No changes were made."}
               </AlertDescription>
             </Alert>
           )}
 
-          {/* Permission summary */}
-          <div className="max-h-60 overflow-y-auto rounded-md border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="text-xs">Resource Type</TableHead>
-                  <TableHead className="text-xs">Permission Level</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {confirmPermissions.map((cp) => (
-                  <TableRow key={cp.resourceType}>
-                    <TableCell className="text-sm py-1.5">
-                      {cp.resourceTypeLabel}
-                    </TableCell>
-                    <TableCell className="py-1.5">
+          {previewData && !previewApply.isPending && (
+            <>
+              {confirmConflictCount > 0 && (
+                <Alert className="border-amber-500/50 bg-amber-500/5">
+                  <AlertTriangle className="h-4 w-4 text-amber-600" />
+                  <AlertTitle className="text-sm text-amber-700 dark:text-amber-400">
+                    {confirmConflictCount} user
+                    {confirmConflictCount !== 1 ? "s" : ""} with cross-persona
+                    conflicts
+                  </AlertTitle>
+                  <AlertDescription className="text-xs">
+                    Some users in this persona's groups also belong to groups
+                    with higher permissions from other personas. Databricks
+                    resolves a multi-group user to the highest level at access
+                    time.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/* Per-type blast radius with checkboxes */}
+              {previewData.plan.length > 0 ? (
+                <div className="max-h-64 overflow-y-auto rounded-md border">
+                  {previewData.plan.map((p) => (
+                    <label
+                      key={p.resource_type}
+                      className="flex items-center gap-3 px-3 py-2 border-b last:border-b-0 hover:bg-muted/50 cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 shrink-0 accent-primary cursor-pointer"
+                        checked={selectedTypes.has(p.resource_type)}
+                        onChange={() => toggleType(p.resource_type)}
+                      />
+                      <span className="flex-1 text-sm font-medium">
+                        {p.resource_type_label}
+                      </span>
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        {p.resource_count} resource
+                        {p.resource_count !== 1 ? "s" : ""}
+                      </span>
                       <Badge
                         variant="outline"
                         className={cn(
                           "text-xs",
-                          getPermissionColor(cp.permissionLevel),
+                          getPermissionColor(p.target_level),
                         )}
                       >
-                        {getPermissionLabel(cp.permissionLevel)}
+                        {getPermissionLabel(p.target_level)}
                       </Badge>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <Alert>
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertTitle className="text-sm">
+                    Nothing to apply
+                  </AlertTitle>
+                  <AlertDescription className="text-xs">
+                    No resource type in this persona's template would be
+                    written (all are at No Permissions or unsupported).
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/* Skipped types (not written), for transparency */}
+              {previewData.skipped.length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium">Not applied:</span>{" "}
+                  {previewData.skipped
+                    .map(
+                      (s) =>
+                        `${s.resource_type_label} (${skipReasonLabel(s.reason)})`,
+                    )
+                    .join(", ")}
+                </p>
+              )}
+
+              {/* Direct-user re-sync count */}
+              {(previewData.direct_user_count ?? 0) > 0 && (
+                <p className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Users className="h-3 w-3 shrink-0" />
+                  Also re-syncing{" "}
+                  <strong className="text-foreground">
+                    {previewData.direct_user_count}
+                  </strong>{" "}
+                  directly-assigned user
+                  {previewData.direct_user_count !== 1 ? "s" : ""} for this
+                  persona.
+                </p>
+              )}
+
+              {/* Selection summary */}
+              {previewData.plan.length > 0 && (
+                <p className="text-sm">
+                  Will rewrite ACLs on{" "}
+                  <strong>{selectedResourceCount}</strong> resource
+                  {selectedResourceCount !== 1 ? "s" : ""} across{" "}
+                  <strong>{selectedTypes.size}</strong> selected type
+                  {selectedTypes.size !== 1 ? "s" : ""}.
+                </p>
+              )}
+            </>
+          )}
 
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleConfirmApply}>
-              Apply Changes
+            <AlertDialogAction
+              onClick={handleConfirmApply}
+              disabled={
+                previewApply.isPending ||
+                !previewData ||
+                selectedTypes.size === 0
+              }
+            >
+              Apply to {selectedTypes.size} type
+              {selectedTypes.size !== 1 ? "s" : ""}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

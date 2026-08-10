@@ -9,12 +9,13 @@ import {
   useCreatePersonaMapping,
   useDeletePersonaMapping,
   useCreatePersonaUserMapping,
-  useDeletePersonaUserMapping,
+  useRemovePersonaMember,
   useCreatePersona,
   useUpdatePersona,
   useDeletePersona,
   listPersonasKey,
   getPermissionMatrixKey,
+  ApiError,
   type PersonaOut,
   type UserOut,
 } from "@/lib/api";
@@ -88,6 +89,13 @@ const PERSONA_ICONS: Record<string, React.ReactNode> = {
   support: <Headphones className="h-5 w-5 text-cyan-500" />,
 };
 
+/** Surface the backend's human-readable `detail` (e.g. the "map groups first"
+ * message) instead of the generic "HTTP 400" status text. */
+function apiDetail(error: ApiError): string {
+  const detail = (error.body as { detail?: unknown } | null)?.detail;
+  return typeof detail === "string" ? detail : error.message;
+}
+
 function PersonasContent() {
   const { data: personas } = useListPersonasSuspense(selector());
   const { data: groups } = useListGroupsSuspense(selector());
@@ -121,8 +129,10 @@ function PersonasContent() {
             Persona Mapping
           </h1>
           <p className="text-muted-foreground mt-1">
-            Map Databricks workspace groups and users to personas. Each persona
-            defines a set of default permissions.
+            Map Databricks workspace groups and users to personas. Adding a user
+            makes them a member of the persona's mapped groups, granting the
+            persona's permissions immediately — no Apply needed. (Use Apply on
+            the matrix only when you change a persona's permission template.)
           </p>
         </div>
         {isAdmin && (
@@ -260,11 +270,12 @@ function PersonaCard({
               <div className="space-y-2">
                 {personaUsers.map((u) => (
                   <UserMappingBadge
-                    key={u.id}
-                    mappingId={u.id}
+                    key={u.user_id}
+                    personaKey={persona.persona}
+                    userId={u.user_id}
                     userName={u.user_name}
                     displayName={u.display_name}
-                    onDeleted={onChanged}
+                    onRemoved={onChanged}
                     isAdmin={isAdmin}
                   />
                 ))}
@@ -283,6 +294,7 @@ function PersonaCard({
             <AddUserDialog
               persona={persona.persona}
               personaLabel={persona.label}
+              personaHasGroups={persona.groups.length > 0}
               availableUsers={availableUsers}
               onCreated={onChanged}
             />
@@ -355,26 +367,34 @@ function GroupMappingBadge({
 }
 
 function UserMappingBadge({
-  mappingId,
+  personaKey,
+  userId,
   userName,
   displayName,
-  onDeleted,
+  onRemoved,
   isAdmin,
 }: {
-  mappingId: number;
-  userName: string;
-  displayName: string;
-  onDeleted: () => void;
+  personaKey: string;
+  userId: string;
+  userName?: string | null;
+  displayName?: string | null;
+  onRemoved: () => void;
   isAdmin: boolean;
 }) {
-  const deleteMapping = useDeletePersonaUserMapping({
+  const label = displayName || userName || userId;
+  const removeMember = useRemovePersonaMember({
     mutation: {
       onSuccess: () => {
-        toast.success(`Removed ${displayName || userName} from persona`);
-        onDeleted();
+        toast.success(
+          `Removed ${label} — access revoked immediately (removed from the persona's mapped groups)`,
+        );
+        onRemoved();
       },
       onError: (error) => {
-        toast.error(`Failed to remove user mapping: ${error.message}`);
+        // On a partial failure the backend returns which group(s) still hold the
+        // user; the members list (SCIM-derived) will keep showing them there.
+        toast.error(`Failed to remove user: ${apiDetail(error)}`);
+        onRemoved();
       },
     },
   });
@@ -382,9 +402,7 @@ function UserMappingBadge({
   return (
     <div className="flex items-center justify-between gap-2 p-2 rounded-md border bg-muted/30">
       <div className="min-w-0">
-        <span className="text-sm truncate block">
-          {displayName || userName}
-        </span>
+        <span className="text-sm truncate block">{label}</span>
         {displayName && userName && (
           <span className="text-xs text-muted-foreground truncate block">
             {userName}
@@ -396,9 +414,12 @@ function UserMappingBadge({
           variant="ghost"
           size="icon"
           className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
-          disabled={deleteMapping.isPending}
+          disabled={removeMember.isPending}
+          title="Remove from persona (revokes group membership immediately)"
           onClick={() => {
-            deleteMapping.mutate({ params: { mapping_id: mappingId } });
+            removeMember.mutate({
+              params: { persona: personaKey, user_name: userName ?? userId },
+            });
           }}
         >
           <Trash2 className="h-3 w-3" />
@@ -512,11 +533,13 @@ function AddGroupDialog({
 function AddUserDialog({
   persona,
   personaLabel,
+  personaHasGroups,
   availableUsers,
   onCreated,
 }: {
   persona: string;
   personaLabel: string;
+  personaHasGroups: boolean;
   availableUsers: UserOut[];
   onCreated: () => void;
 }) {
@@ -526,13 +549,15 @@ function AddUserDialog({
   const createMapping = useCreatePersonaUserMapping({
     mutation: {
       onSuccess: () => {
-        toast.success("User mapped to persona successfully");
+        toast.success(
+          "User added — access granted immediately via group membership (no Apply needed)",
+        );
         setOpen(false);
         setSelectedUser("");
         onCreated();
       },
       onError: (error) => {
-        toast.error(`Failed to map user: ${error.message}`);
+        toast.error(`Failed to add user: ${apiDetail(error)}`);
       },
     },
   });
@@ -553,14 +578,21 @@ function AddUserDialog({
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Map User to {personaLabel}</DialogTitle>
+          <DialogTitle>Add User to {personaLabel}</DialogTitle>
           <DialogDescription>
-            Select a workspace user to directly assign the{" "}
-            <strong>{personaLabel}</strong> persona permissions.
+            The user becomes a member of every workspace group mapped to the{" "}
+            <strong>{personaLabel}</strong> persona and inherits its permissions{" "}
+            <strong>immediately</strong> — no Apply or Refresh needed.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 pt-4">
-          {availableUsers.length === 0 ? (
+          {!personaHasGroups ? (
+            <p className="text-sm text-muted-foreground">
+              This persona has no mapped groups yet, so adding a user would grant
+              no access. Map one or more workspace groups to{" "}
+              <strong>{personaLabel}</strong> first, then add users.
+            </p>
+          ) : availableUsers.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               All users are already directly mapped to personas.
             </p>
@@ -591,6 +623,7 @@ function AddUserDialog({
               disabled={
                 !selectedUser ||
                 createMapping.isPending ||
+                !personaHasGroups ||
                 availableUsers.length === 0
               }
               onClick={() => {
@@ -607,7 +640,7 @@ function AddUserDialog({
                 }
               }}
             >
-              {createMapping.isPending ? "Mapping..." : "Map User"}
+              {createMapping.isPending ? "Adding..." : "Add User"}
             </Button>
           </div>
         </div>

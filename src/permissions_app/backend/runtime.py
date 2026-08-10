@@ -128,6 +128,32 @@ class Runtime:
             )
 
     def initialize_models(self) -> None:
+        """Create tables, ensure UNIQUE constraints, and seed defaults — ONCE,
+        idempotently, and concurrency-safe across uvicorn workers.
+
+        All DDL + seeding runs inside a SINGLE transaction on ONE connection that
+        first takes a Postgres transaction-scoped advisory lock. When N workers
+        start together, exactly one performs the bootstrap while the others block
+        on the lock, then observe the finished state — so ``create_all`` never
+        races on DDL, the default seed set is written exactly once (with
+        ``INSERT ... ON CONFLICT DO NOTHING`` as a second guard), and no worker
+        crashes on startup. The advisory lock auto-releases at transaction end.
+        """
+        from .seed import (
+            BOOTSTRAP_LOCK_KEY,
+            ensure_unique_constraints,
+            seed_defaults,
+        )
+
         logger.info("Initializing database models")
-        SQLModel.metadata.create_all(self.engine)
+        with self.engine.begin() as conn:
+            # Serialize the whole bootstrap across workers/processes; the lock is
+            # DB-wide (same key) and released automatically when this tx commits.
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"),
+                {"k": BOOTSTRAP_LOCK_KEY},
+            )
+            SQLModel.metadata.create_all(conn)
+            ensure_unique_constraints(conn)
+            seed_defaults(conn)
         logger.info("Database models initialized successfully")

@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Request
+import uuid
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -6,6 +8,29 @@ from databricks.sdk.errors import DatabricksError
 
 from .._metadata import api_prefix, dist_dir
 from .logger import logger
+
+
+def raise_internal_error(context: str, exc: Exception, *, status_code: int) -> None:
+    """Log an UNEXPECTED exception in full server-side under a correlation id and
+    raise a generic ``HTTPException`` that leaks no upstream/SDK detail.
+
+    Use this ONLY for the broad ``except Exception`` around an SDK call, where
+    ``str(exc)`` would otherwise put raw SDK/config text (resource ids, config
+    dumps) into the client response. The full detail — including traceback — is
+    logged so operators can still diagnose it via the correlation id.
+
+    The HTTP status is preserved (passed by the caller), so client-observable
+    behaviour is unchanged; only the leaky detail string is replaced. This is
+    NOT used for the intentional, useful errors we raise ourselves (validation
+    400s, 404s, the Fix-5 level messages, Fix-3 SCIM 502s, no-mapped-groups
+    400s) — those are raised directly with their specific, helpful text.
+    """
+    correlation_id = uuid.uuid4().hex
+    logger.error(f"[{correlation_id}] {context}: {exc}", exc_info=True)
+    raise HTTPException(
+        status_code=status_code,
+        detail=f"{context}. An internal error occurred. Reference: {correlation_id}",
+    )
 
 # Substrings that indicate the caller's Databricks access token is expired or
 # otherwise invalid (as opposed to a genuine authorization failure). The Apps

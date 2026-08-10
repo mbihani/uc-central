@@ -1,3 +1,5 @@
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -34,6 +36,15 @@ from .logger import logger
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Set the application log level explicitly. Production runs plain
+    # `uvicorn ... --workers 2` (no --log-config), so the .apx dev logging config
+    # does NOT apply at runtime — this is what actually governs prod verbosity.
+    # Default INFO (never DEBUG in prod); raise/lower via env when needed. No
+    # tokens or PII are logged at INFO (only config metadata, resource ids in
+    # WARNING/ERROR diagnostics, and correlation ids for redacted errors).
+    _log_level = os.environ.get("PERMISSIONS_APP_LOG_LEVEL", "INFO").upper()
+    logging.getLogger(app_name).setLevel(getattr(logging, _log_level, logging.INFO))
+
     # Initialize config and runtime, store in app.state for dependency injection
     config = AppConfig()
     logger.info(f"Starting app with configuration:\n{config}")

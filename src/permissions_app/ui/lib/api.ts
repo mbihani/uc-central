@@ -6,10 +6,39 @@ export interface AddMemberIn {
 }
 
 export interface ApplyAllResultOut {
+  direct_users_synced?: number;
   persona: string;
   results: ApplyResultOut[];
   total_errors: number;
   total_resources_updated: number;
+}
+
+export interface ApplyPermissionsIn {
+  resource_types?: string[] | null;
+}
+
+export interface ApplyPlanItemOut {
+  resource_count: number;
+  resource_type: string;
+  resource_type_label: string;
+  target_level: string;
+}
+
+export interface ApplyPlanSkippedOut {
+  reason: string;
+  resource_type: string;
+  resource_type_label: string;
+  target_level: string;
+}
+
+export interface ApplyPreviewOut {
+  direct_user_count?: number;
+  group_count: number;
+  groups: string[];
+  persona: string;
+  plan: ApplyPlanItemOut[];
+  skipped: ApplyPlanSkippedOut[];
+  total_resources_affected: number;
 }
 
 export interface ApplyResultOut {
@@ -152,25 +181,26 @@ export interface PersonaGroupMappingOut {
   persona: string;
 }
 
+export interface PersonaMemberOut {
+  assignment_type?: string;
+  display_name?: string | null;
+  groups?: string[];
+  persona: string;
+  user_id: string;
+  user_name?: string | null;
+}
+
 export interface PersonaOut {
   description: string;
   groups: PersonaGroupMappingOut[];
   is_default?: boolean;
   label: string;
   persona: string;
-  users?: PersonaUserMappingOut[];
+  users?: PersonaMemberOut[];
 }
 
 export interface PersonaUserMappingIn {
   display_name?: string;
-  persona: string;
-  user_id: string;
-  user_name: string;
-}
-
-export interface PersonaUserMappingOut {
-  display_name: string;
-  id: number;
   persona: string;
   user_id: string;
   user_name: string;
@@ -300,11 +330,24 @@ export interface ApplyPermissionsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface PreviewApplyPermissionsParams {
+  persona: string;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface CheckPermissionConflictsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface GetPermissionMatrixParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface UpdatePermissionMatrixParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ListPersonasParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
@@ -325,11 +368,6 @@ export interface CreatePersonaUserMappingParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
-export interface DeletePersonaUserMappingParams {
-  mapping_id: number;
-  "X-Forwarded-Access-Token"?: string | null;
-}
-
 export interface UpdatePersonaParams {
   persona_key: string;
   "X-Forwarded-Access-Token"?: string | null;
@@ -337,6 +375,12 @@ export interface UpdatePersonaParams {
 
 export interface DeletePersonaParams {
   persona_key: string;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface RemovePersonaMemberParams {
+  persona: string;
+  user_name: string;
   "X-Forwarded-Access-Token"?: string | null;
 }
 
@@ -515,8 +559,8 @@ export function useAddGroupMember(options?: { mutation?: UseMutationOptions<{ da
   return useMutation({ mutationFn: (vars) => addGroupMember(vars.params, vars.data), ...options?.mutation });
 }
 
-export const applyPermissions = async (params: ApplyPermissionsParams, options?: RequestInit): Promise<{ data: ApplyAllResultOut }> => {
-  const res = await fetch(`/api/permissions/apply/${params.persona}`, { ...options, method: "POST", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+export const applyPermissions = async (params: ApplyPermissionsParams, data: ApplyPermissionsIn | null, options?: RequestInit): Promise<{ data: ApplyAllResultOut }> => {
+  const res = await fetch(`/api/permissions/apply/${params.persona}`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -526,8 +570,31 @@ export const applyPermissions = async (params: ApplyPermissionsParams, options?:
   return { data: await res.json() };
 };
 
-export function useApplyPermissions(options?: { mutation?: UseMutationOptions<{ data: ApplyAllResultOut }, ApiError, { params: ApplyPermissionsParams }> }) {
-  return useMutation({ mutationFn: (vars) => applyPermissions(vars.params), ...options?.mutation });
+export function useApplyPermissions(options?: { mutation?: UseMutationOptions<{ data: ApplyAllResultOut }, ApiError, { params: ApplyPermissionsParams; data: ApplyPermissionsIn | null }> }) {
+  return useMutation({ mutationFn: (vars) => applyPermissions(vars.params, vars.data), ...options?.mutation });
+}
+
+export const previewApplyPermissions = async (params: PreviewApplyPermissionsParams, options?: RequestInit): Promise<{ data: ApplyPreviewOut }> => {
+  const res = await fetch(`/api/permissions/apply/${params.persona}/preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const previewApplyPermissionsKey = (params?: PreviewApplyPermissionsParams) => {
+  return ["/api/permissions/apply/{persona}/preview", params] as const;
+};
+
+export function usePreviewApplyPermissions<TData = { data: ApplyPreviewOut }>(options: { params: PreviewApplyPermissionsParams; query?: Omit<UseQueryOptions<{ data: ApplyPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: previewApplyPermissionsKey(options.params), queryFn: () => previewApplyPermissions(options.params), ...options?.query });
+}
+
+export function usePreviewApplyPermissionsSuspense<TData = { data: ApplyPreviewOut }>(options: { params: PreviewApplyPermissionsParams; query?: Omit<UseSuspenseQueryOptions<{ data: ApplyPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: previewApplyPermissionsKey(options.params), queryFn: () => previewApplyPermissions(options.params), ...options?.query });
 }
 
 export const checkPermissionConflicts = async (params?: CheckPermissionConflictsParams, options?: RequestInit): Promise<{ data: PermissionConflictsOut }> => {
@@ -553,8 +620,8 @@ export function useCheckPermissionConflictsSuspense<TData = { data: PermissionCo
   return useSuspenseQuery({ queryKey: checkPermissionConflictsKey(options?.params), queryFn: () => checkPermissionConflicts(options?.params), ...options?.query });
 }
 
-export const getPermissionMatrix = async (options?: RequestInit): Promise<{ data: PermissionMatrixOut }> => {
-  const res = await fetch("/api/permissions/matrix", { ...options, method: "GET" });
+export const getPermissionMatrix = async (params?: GetPermissionMatrixParams, options?: RequestInit): Promise<{ data: PermissionMatrixOut }> => {
+  const res = await fetch("/api/permissions/matrix", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -564,16 +631,16 @@ export const getPermissionMatrix = async (options?: RequestInit): Promise<{ data
   return { data: await res.json() };
 };
 
-export const getPermissionMatrixKey = () => {
-  return ["/api/permissions/matrix"] as const;
+export const getPermissionMatrixKey = (params?: GetPermissionMatrixParams) => {
+  return ["/api/permissions/matrix", params] as const;
 };
 
-export function useGetPermissionMatrix<TData = { data: PermissionMatrixOut }>(options?: { query?: Omit<UseQueryOptions<{ data: PermissionMatrixOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
-  return useQuery({ queryKey: getPermissionMatrixKey(), queryFn: () => getPermissionMatrix(), ...options?.query });
+export function useGetPermissionMatrix<TData = { data: PermissionMatrixOut }>(options?: { params?: GetPermissionMatrixParams; query?: Omit<UseQueryOptions<{ data: PermissionMatrixOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: getPermissionMatrixKey(options?.params), queryFn: () => getPermissionMatrix(options?.params), ...options?.query });
 }
 
-export function useGetPermissionMatrixSuspense<TData = { data: PermissionMatrixOut }>(options?: { query?: Omit<UseSuspenseQueryOptions<{ data: PermissionMatrixOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
-  return useSuspenseQuery({ queryKey: getPermissionMatrixKey(), queryFn: () => getPermissionMatrix(), ...options?.query });
+export function useGetPermissionMatrixSuspense<TData = { data: PermissionMatrixOut }>(options?: { params?: GetPermissionMatrixParams; query?: Omit<UseSuspenseQueryOptions<{ data: PermissionMatrixOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: getPermissionMatrixKey(options?.params), queryFn: () => getPermissionMatrix(options?.params), ...options?.query });
 }
 
 export const updatePermissionMatrix = async (data: PermissionMatrixCell, params?: UpdatePermissionMatrixParams, options?: RequestInit): Promise<{ data: PermissionTemplateOut }> => {
@@ -591,8 +658,8 @@ export function useUpdatePermissionMatrix(options?: { mutation?: UseMutationOpti
   return useMutation({ mutationFn: (vars) => updatePermissionMatrix(vars.data, vars.params), ...options?.mutation });
 }
 
-export const listPersonas = async (options?: RequestInit): Promise<{ data: PersonaOut[] }> => {
-  const res = await fetch("/api/personas", { ...options, method: "GET" });
+export const listPersonas = async (params?: ListPersonasParams, options?: RequestInit): Promise<{ data: PersonaOut[] }> => {
+  const res = await fetch("/api/personas", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -602,16 +669,16 @@ export const listPersonas = async (options?: RequestInit): Promise<{ data: Perso
   return { data: await res.json() };
 };
 
-export const listPersonasKey = () => {
-  return ["/api/personas"] as const;
+export const listPersonasKey = (params?: ListPersonasParams) => {
+  return ["/api/personas", params] as const;
 };
 
-export function useListPersonas<TData = { data: PersonaOut[] }>(options?: { query?: Omit<UseQueryOptions<{ data: PersonaOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
-  return useQuery({ queryKey: listPersonasKey(), queryFn: () => listPersonas(), ...options?.query });
+export function useListPersonas<TData = { data: PersonaOut[] }>(options?: { params?: ListPersonasParams; query?: Omit<UseQueryOptions<{ data: PersonaOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: listPersonasKey(options?.params), queryFn: () => listPersonas(options?.params), ...options?.query });
 }
 
-export function useListPersonasSuspense<TData = { data: PersonaOut[] }>(options?: { query?: Omit<UseSuspenseQueryOptions<{ data: PersonaOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
-  return useSuspenseQuery({ queryKey: listPersonasKey(), queryFn: () => listPersonas(), ...options?.query });
+export function useListPersonasSuspense<TData = { data: PersonaOut[] }>(options?: { params?: ListPersonasParams; query?: Omit<UseSuspenseQueryOptions<{ data: PersonaOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: listPersonasKey(options?.params), queryFn: () => listPersonas(options?.params), ...options?.query });
 }
 
 export const createPersona = async (data: PersonaDefinitionIn, params?: CreatePersonaParams, options?: RequestInit): Promise<{ data: PersonaDefinitionOut }> => {
@@ -659,7 +726,7 @@ export function useDeletePersonaMapping(options?: { mutation?: UseMutationOption
   return useMutation({ mutationFn: (vars) => deletePersonaMapping(vars.params), ...options?.mutation });
 }
 
-export const createPersonaUserMapping = async (data: PersonaUserMappingIn, params?: CreatePersonaUserMappingParams, options?: RequestInit): Promise<{ data: PersonaUserMappingOut }> => {
+export const createPersonaUserMapping = async (data: PersonaUserMappingIn, params?: CreatePersonaUserMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
   const res = await fetch("/api/personas/user-mappings", { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
@@ -670,23 +737,8 @@ export const createPersonaUserMapping = async (data: PersonaUserMappingIn, param
   return { data: await res.json() };
 };
 
-export function useCreatePersonaUserMapping(options?: { mutation?: UseMutationOptions<{ data: PersonaUserMappingOut }, ApiError, { params: CreatePersonaUserMappingParams; data: PersonaUserMappingIn }> }) {
+export function useCreatePersonaUserMapping(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: CreatePersonaUserMappingParams; data: PersonaUserMappingIn }> }) {
   return useMutation({ mutationFn: (vars) => createPersonaUserMapping(vars.data, vars.params), ...options?.mutation });
-}
-
-export const deletePersonaUserMapping = async (params: DeletePersonaUserMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/personas/user-mappings/${params.mapping_id}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
-  if (!res.ok) {
-    const body = await res.text();
-    let parsed: unknown;
-    try { parsed = JSON.parse(body); } catch { parsed = body; }
-    throw new ApiError(res.status, res.statusText, parsed);
-  }
-  return { data: await res.json() };
-};
-
-export function useDeletePersonaUserMapping(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: DeletePersonaUserMappingParams }> }) {
-  return useMutation({ mutationFn: (vars) => deletePersonaUserMapping(vars.params), ...options?.mutation });
 }
 
 export const updatePersona = async (params: UpdatePersonaParams, data: PersonaDefinitionUpdateIn, options?: RequestInit): Promise<{ data: PersonaDefinitionOut }> => {
@@ -717,6 +769,21 @@ export const deletePersona = async (params: DeletePersonaParams, options?: Reque
 
 export function useDeletePersona(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: DeletePersonaParams }> }) {
   return useMutation({ mutationFn: (vars) => deletePersona(vars.params), ...options?.mutation });
+}
+
+export const removePersonaMember = async (params: RemovePersonaMemberParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+  const res = await fetch(`/api/personas/${params.persona}/members/${params.user_name}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useRemovePersonaMember(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: RemovePersonaMemberParams }> }) {
+  return useMutation({ mutationFn: (vars) => removePersonaMember(vars.params), ...options?.mutation });
 }
 
 export const listResourcesByType = async (params: ListResourcesByTypeParams, options?: RequestInit): Promise<{ data: ResourceItemOut[] }> => {

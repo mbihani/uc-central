@@ -38,3 +38,13 @@ node_modules/
 
 # UI dist folder
 src/permissions_app/__dist__/
+venv/
+*.pyc
+!.env.example
+.build/
+.terraform/
+*.tfstate*
+.ipynb_checkpoints/
+*.pex
+mlflow.db
+dist_wheel/

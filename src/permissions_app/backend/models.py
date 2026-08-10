@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from .. import __version__
@@ -191,6 +192,33 @@ RESOURCE_PERMISSION_LEVELS: dict[ResourceType, list[PermissionLevel]] = {
 }
 
 
+def is_permission_level_allowed(resource_type: str, permission_level: str) -> bool:
+    """Whether ``permission_level`` is valid for ``resource_type``.
+
+    Enforces the per-resource-type allow-lists in ``RESOURCE_PERMISSION_LEVELS``
+    so a level a resource type does not support (e.g. ``CAN_MANAGE`` on a
+    cluster-policy, which only supports ``CAN_USE``) is rejected before it ever
+    reaches the Databricks ACL API.
+
+    - ``NO_PERMISSIONS`` (revoke) is ALWAYS allowed, for every type.
+    - An UNKNOWN resource type (not a ``ResourceType`` member) returns ``True``:
+      those have no allow-list to validate against and are intentionally left to
+      the existing "unsupported resource type" error path, so this predicate
+      never masks that clearer, pre-existing error.
+    """
+    if permission_level == PermissionLevel.NO_PERMISSIONS.value:
+        return True
+    try:
+        rt = ResourceType(resource_type)
+    except ValueError:
+        return True
+    try:
+        pl = PermissionLevel(permission_level)
+    except ValueError:
+        return False
+    return pl in RESOURCE_PERMISSION_LEVELS.get(rt, [])
+
+
 # ─── Database Models (SQLModel) ──────────────────────────────────────────────
 
 
@@ -210,6 +238,13 @@ class PersonaGroupMapping(SQLModel, table=True):
     """Maps a Databricks workspace group to a persona."""
 
     __tablename__ = "persona_group_mapping"
+    # A workspace group maps to AT MOST ONE persona — the app already enforces
+    # this in ``create_persona_mapping`` (check-then-insert). The DB-level UNIQUE
+    # makes it race-proof: two concurrent creates for the same group can never
+    # both land, and the invariant holds even under the multi-worker startup.
+    __table_args__ = (
+        UniqueConstraint("group_id", name="uq_persona_group_mapping_group_id"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     group_id: str = Field(index=True)
@@ -221,6 +256,16 @@ class PersonaUserMapping(SQLModel, table=True):
     """Maps a Databricks workspace user directly to a persona."""
 
     __tablename__ = "persona_user_mapping"
+    # One direct-assignment row per (persona, user_name). Enforced both here
+    # and via ensure_unique_constraints in seed.py (migration bootstrap) so
+    # pre-existing databases without the constraint are upgraded idempotently.
+    __table_args__ = (
+        UniqueConstraint(
+            "persona",
+            "user_name",
+            name="uq_persona_user_mapping_persona_user_name",
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: str = Field(index=True)
@@ -233,6 +278,18 @@ class PermissionTemplate(SQLModel, table=True):
     """Stores the default permission level per persona per resource type."""
 
     __tablename__ = "permission_template"
+    # Exactly ONE row per (persona, resource_type). This is the seed table that
+    # previously had NO uniqueness, so a concurrent (multi-worker) seed could
+    # insert duplicate cells. The UNIQUE constraint makes the seed an idempotent
+    # upsert (INSERT ... ON CONFLICT DO NOTHING) and guarantees a single clean
+    # matrix cell per (persona, type).
+    __table_args__ = (
+        UniqueConstraint(
+            "persona",
+            "resource_type",
+            name="uq_permission_template_persona_resource_type",
+        ),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     persona: str = Field(index=True)  # references PersonaDefinition.key
@@ -307,12 +364,23 @@ class PersonaUserMappingIn(BaseModel):
     persona: str  # persona key (string, validated against DB)
 
 
-class PersonaUserMappingOut(BaseModel):
-    id: int
-    user_id: str
-    user_name: str
-    display_name: str
+class PersonaMemberOut(BaseModel):
+    """A member of a persona — either via group membership or direct assignment.
+
+    ``assignment_type`` is one of:
+      * ``"group"``  — the user is a member of a mapped workspace group;
+                       ``groups`` lists which mapped group(s).
+      * ``"direct"`` — the user was added directly via the persona user-mapping
+                       (per-user ACL entry); not a member of any persona group.
+      * ``"both"``   — appears in both paths (group AND direct).
+    """
+
+    user_id: str  # SCIM principal id (as it appears in group membership)
+    user_name: Optional[str] = None
+    display_name: Optional[str] = None
     persona: str
+    groups: list[str] = []  # mapped-group display names this member belongs to
+    assignment_type: str = "group"  # "group" | "direct" | "both"
 
 
 class PersonaOut(BaseModel):
@@ -321,7 +389,7 @@ class PersonaOut(BaseModel):
     description: str
     is_default: bool = False
     groups: list[PersonaGroupMappingOut]
-    users: list[PersonaUserMappingOut] = []
+    users: list[PersonaMemberOut] = []
 
 
 # Permission Template models
@@ -420,6 +488,76 @@ class ApplyAllResultOut(BaseModel):
     results: list[ApplyResultOut]
     total_resources_updated: int
     total_errors: int
+    direct_users_synced: int = 0
+
+
+# ─── Apply preview (dry-run) + type scoping models ───────────────────────────
+
+
+class ApplyPermissionsIn(BaseModel):
+    """OPTIONAL request body for the persona Apply (POST /permissions/apply/{persona}).
+
+    ``resource_types`` scopes the blast radius: when a non-null list is supplied,
+    the apply touches ONLY those resource types — each of the persona's mapped
+    groups is still set to THIS persona's own template level for that type
+    (Fix-1); no cross-persona resolution. When omitted / null, the apply covers
+    ALL resource types in the persona's template (the original behaviour, fully
+    backward compatible). Requested types are validated against the persona's
+    template on the server.
+    """
+
+    resource_types: Optional[list[str]] = None
+
+
+class ApplyPlanItemOut(BaseModel):
+    """One resource type that a REAL apply WOULD write to (dry-run row).
+
+    Only emitted for types that are supported by the apply path AND carry a
+    concrete (non-``NO_PERMISSIONS``, type-valid) level in the persona's
+    template. ``resource_count`` is how many live workspace resources of this
+    type would have the persona's groups (re)set to ``target_level``.
+    """
+
+    resource_type: str
+    resource_type_label: str
+    target_level: str
+    resource_count: int
+
+
+class ApplyPlanSkippedOut(BaseModel):
+    """A resource type the dry-run plan skips, with the reason it would NOT be
+    written by a real apply.
+
+    ``reason`` is one of:
+      * ``no_permissions`` — the template level is ``NO_PERMISSIONS`` (nothing to
+        grant; a revoke of a group not present is a no-op);
+      * ``unsupported`` — the app has no lister for this type, so apply cannot
+        enumerate/write it (it reports an explicit error at apply time);
+      * ``invalid_level`` — the template level is not valid for this type (a stale
+        matrix cell); apply skips it per-type (Fix-5).
+    """
+
+    resource_type: str
+    resource_type_label: str
+    target_level: str
+    reason: str
+
+
+class ApplyPreviewOut(BaseModel):
+    """Dry-run PLAN for applying a persona — computed with ZERO ACL writes.
+
+    Mirrors the real apply's per-type branching so an admin can see the blast
+    radius (how many resources of each type would change, and to what level)
+    BEFORE any ACL is rewritten, and choose which types to include.
+    """
+
+    persona: str
+    group_count: int
+    groups: list[str]
+    plan: list[ApplyPlanItemOut]
+    skipped: list[ApplyPlanSkippedOut]
+    total_resources_affected: int
+    direct_user_count: int = 0
 
 
 # Dashboard stats
