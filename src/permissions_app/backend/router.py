@@ -1273,7 +1273,7 @@ def _compute_apply_plan(
 
       * unsupported type (no lister) -> skipped (``unsupported``);
       * ``NO_PERMISSIONS`` level     -> skipped (``no_permissions``, a no-op/revoke);
-      * type-invalid level (Fix-5)   -> skipped (``invalid_level``);
+      * type-invalid level          -> skipped (``invalid_level``);
       * otherwise                    -> a plan row with the LIVE resource count.
 
     The only workspace calls made here are ``list_resources`` reads (to count how
@@ -1359,7 +1359,7 @@ def preview_apply_permissions(
     Returns, for every resource type the real apply WOULD write, the target
     level and how many live workspace resources of that type would be affected;
     types at ``NO_PERMISSIONS`` or that are unsupported/invalid are reported
-    separately as skipped. Admin-gated (Fix-6) exactly like the real apply, and
+    separately as skipped. Admin-gated exactly like the real apply, and
     validated with the same persona/mappings/template preconditions so a
     successful preview implies a runnable apply.
     """
@@ -1424,7 +1424,7 @@ def apply_permissions(
     By default this covers ALL resource types in the persona's template. Supply
     an optional body ``{"resource_types": [...]}`` to SCOPE the apply to only
     those types (blast-radius reduction) — each mapped group is still set to THIS
-    persona's own template level for the type (Fix-1); omitting the body / field
+    persona's own template level for the type; omitting the body / field
     preserves the original all-types behaviour.
     """
     # Validate persona exists
@@ -1455,7 +1455,7 @@ def apply_permissions(
         )
 
     # Optional per-resource-TYPE scoping. When the caller provides resource_types,
-    # apply ONLY those types (still each group at THIS persona's own level, Fix-1);
+    # apply ONLY those types (still each group at THIS persona's own level);
     # None/omitted => all template types (original behaviour). Requested types are
     # validated against the persona's own template so an unknown/mistyped type is a
     # clear 400 rather than a silent no-op.

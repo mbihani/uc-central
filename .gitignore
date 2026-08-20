@@ -31,8 +31,11 @@ node_modules
 # mac
 .DS_Store
 
-# DABs 
+# DABs
 .databricks
+# Local bundle overrides (host/profile) — never commit internal workspace config
+databricks.local.yml
+databricks.*.local.yml
 
 # apx
 .apx/

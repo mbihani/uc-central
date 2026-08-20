@@ -10,6 +10,9 @@ from .config import AppConfig
 from .logger import logger
 from .runtime import Runtime
 
+# CONFIGURE(admin-group): the workspace group that gates all admin actions.
+# Defaults to "admins" (standard on every workspace). Override only if your
+# workspace uses a non-standard admin group name.
 ADMIN_GROUP_NAME = "admins"
 
 

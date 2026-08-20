@@ -1,7 +1,7 @@
 [project]
 name = "permissions-app"
 dynamic = ["version"]
-description = "Add your description here"
+description = "UC Central — persona-based workspace permission management for Databricks"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,7 +19,7 @@ dev = [
 ]
 
 [tool.apx.metadata]
-app-name = "permissions-app"
+app-name = "UC Central"  # CONFIGURE(brand-name): the customer-facing product name. Single source of truth — vite reads this for the navbar/HTML title; apx build regenerates _metadata.py from it for the FastAPI title. Rename here + rebuild.
 app-slug = "permissions_app"
 app-entrypoint = "permissions_app.backend.app:app"
 api-prefix = "/api"

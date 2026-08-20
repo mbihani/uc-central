@@ -22,7 +22,7 @@ def raise_internal_error(context: str, exc: Exception, *, status_code: int) -> N
     The HTTP status is preserved (passed by the caller), so client-observable
     behaviour is unchanged; only the leaky detail string is replaced. This is
     NOT used for the intentional, useful errors we raise ourselves (validation
-    400s, 404s, the Fix-5 level messages, Fix-3 SCIM 502s, no-mapped-groups
+    400s, 404s, the invalid-level messages, SCIM 502s, no-mapped-groups
     400s) — those are raised directly with their specific, helpful text.
     """
     correlation_id = uuid.uuid4().hex

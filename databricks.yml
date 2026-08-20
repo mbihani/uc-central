@@ -1,30 +1,104 @@
+# UC Central — Databricks Asset Bundle
+#
+# Turnkey deploy of UC Central as a Databricks App bound to a pre-created
+# Lakebase Postgres 16 instance.
+#
+#   0. (once) pre-create the PG16 instance — see DEPLOYMENT.md (REQUIRED; the
+#      bundle cannot pin pg_version — see the instance_name variable below).
+#   1. databricks bundle deploy  -t dev --profile <your-profile>   # create the app + bind it
+#   2. databricks bundle run uc-central-setup -t dev --profile <your-profile>   # grant + SP-admin
+#
+# See DEPLOYMENT.md for the full procedure and prerequisites.
+# See MANIFESTO.md for every configurable value in this bundle.
 bundle:
-  name: "permissions-app"
+  name: uc-central
+  engine: direct          # Go-SDK deploy (requires Databricks CLI v1.3+)
 
+# Sync the pre-built app artifact (.build/) AND the one-shot setup notebook.
+# `.build/` is produced by the build step (vite build + apx build) — see
+# DEPLOYMENT.md. `bundle deploy` syncs the pre-built artifact (no build step).
 sync:
   include:
     - .build
+    - setup
 
-artifacts:
-  default:
-    build: uv run apx build
+variables:
+  app_name:
+    description: "Name of the UC Central Databricks App (lowercase, hyphenated)."
+    default: "uc-central"  # CONFIGURE(app-name): the Databricks App resource name
+  instance_name:
+    description: >-
+      Name of the PRE-CREATED Lakebase Postgres 16 instance the app binds to
+      (becomes PGAPPNAME at runtime). Must exist before `bundle deploy` — the
+      bundle does NOT create or manage this instance. The database_instances
+      resource cannot pin pg_version, and PG 17 breaks the app database
+      binding's env injection, so create the instance via REST/CLI with
+      pg_version=PG_VERSION_16 first (see DEPLOYMENT.md). Because the instance
+      is external to the bundle, `bundle destroy` does NOT delete it — delete
+      it separately if desired.
+    default: "uc-central"  # CONFIGURE(instance-name): pre-created Lakebase PG16 instance name
 
 resources:
+  # --- The app (own URL + bound to the external Lakebase instance) -------------
   apps:
-    permissions-app-app:
-      name: "permissions-app"
-      description: "permissions-app created with apx"
+    uc-central-app:
+      name: ${var.app_name}
+      description: "UC Central — permissions management"
       source_code_path: ./.build
+      resources:
+        # Lakebase `database` binding: injects PGAPPNAME at runtime AND enrolls
+        # the app SP as a Postgres role (CAN_CONNECT_AND_CREATE) on the instance.
+        # instance_name is a plain variable (NOT a cross-resource ref) because the
+        # PG16 instance is created OUTSIDE the bundle — see the variable comment
+        # and DEPLOYMENT.md. This guarantees PG16 and keeps the instance lifecycle
+        # independent of `bundle destroy`.
+        - name: db
+          database:
+            instance_name: ${var.instance_name}
+            database_name: databricks_postgres  # CONFIGURE(database-name): Postgres database name (fixed by the app; also injected as PGDATABASE at runtime)
+            permission: CAN_CONNECT_AND_CREATE
 
-
-
-
-
+  # --- One-shot setup job: the two non-declarative residues ------------------
+  # Run AFTER `bundle deploy` via `databricks bundle run uc-central-setup -t dev`.
+  # Automates (a) GRANT on schema public + (b) adding the app SP to `admins`.
+  # run_as is omitted → defaults to the deploying user (dev mode). That user MUST
+  # be a workspace admin (for the SCIM PATCH) AND a Postgres/DATABRICKS superuser
+  # on the instance (for the GRANT). See setup/grant.py for the idempotent,
+  # retry-hardened implementation.
+  #
+  # For a production target, set an explicit run_as (production bundles require
+  # it). Uncomment and set one of:
+  # CONFIGURE(production-run-as): the principal the setup job runs as in production
+  #     run_as:
+  #       service_principal_name: <your-sp>   # OR: user_name: <your-user>@...
+  jobs:
+    uc-central-setup:
+      name: "[${bundle.target}] uc-central setup (grant + SP-admin)"
+      environments:
+        - environment_key: setup_env
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk"
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ./setup/grant.py
+            source: WORKSPACE
+            base_parameters:
+              app_name: ${var.app_name}
+              instance_name: ${var.instance_name}
+          environment_key: setup_env
 
 targets:
   dev:
     mode: development
     default: true
-    workspace:
-      host: https://fevm-stable-classic-7ppxjq.cloud.databricks.com
-      profile: fevm-stable
+    # No hardcoded workspace host/profile is committed — supply yours via the CLI
+    # `--profile <your-profile>` flag on every bundle command. The workspace host
+    # is resolved from that profile's auth config.
+    #   databricks bundle validate -t dev --profile <your-profile>
+    #   databricks bundle deploy  -t dev --profile <your-profile>
+    # CONFIGURE(cli-profile): the `databricks` CLI auth profile (passed via --profile; not stored in this file)
+    # CONFIGURE(workspace-host): resolved from the profile above (no value committed here)

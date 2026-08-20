@@ -42,6 +42,8 @@ async def lifespan(app: FastAPI):
     # Default INFO (never DEBUG in prod); raise/lower via env when needed. No
     # tokens or PII are logged at INFO (only config metadata, resource ids in
     # WARNING/ERROR diagnostics, and correlation ids for redacted errors).
+    # CONFIGURE(log-level): raise/lower verbosity via PERMISSIONS_APP_LOG_LEVEL
+    # (DEBUG/INFO/WARNING/ERROR). Default INFO — never DEBUG in prod (no PII).
     _log_level = os.environ.get("PERMISSIONS_APP_LOG_LEVEL", "INFO").upper()
     logging.getLogger(app_name).setLevel(getattr(logging, _log_level, logging.INFO))
 

@@ -499,8 +499,8 @@ class ApplyPermissionsIn(BaseModel):
 
     ``resource_types`` scopes the blast radius: when a non-null list is supplied,
     the apply touches ONLY those resource types — each of the persona's mapped
-    groups is still set to THIS persona's own template level for that type
-    (Fix-1); no cross-persona resolution. When omitted / null, the apply covers
+    groups is still set to THIS persona's own template level for that type;
+    no cross-persona resolution. When omitted / null, the apply covers
     ALL resource types in the persona's template (the original behaviour, fully
     backward compatible). Requested types are validated against the persona's
     template on the server.
@@ -534,7 +534,7 @@ class ApplyPlanSkippedOut(BaseModel):
       * ``unsupported`` — the app has no lister for this type, so apply cannot
         enumerate/write it (it reports an explicit error at apply time);
       * ``invalid_level`` — the template level is not valid for this type (a stale
-        matrix cell); apply skips it per-type (Fix-5).
+        matrix cell); apply skips it per-type.
     """
 
     resource_type: str
