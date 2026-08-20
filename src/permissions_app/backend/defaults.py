@@ -26,6 +26,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_MANAGE,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_MANAGE,
         ResourceType.ALERTS: PermissionLevel.CAN_MANAGE,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_MANAGE,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
     },
     Persona.DATA_ENGINEER: {
@@ -43,6 +44,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
     },
     Persona.DATA_SCIENTIST: {
@@ -60,6 +62,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
     },
     Persona.ANALYST: {
@@ -77,6 +80,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
     },
     Persona.DEPLOYER: {
@@ -94,6 +98,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_MANAGE,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_MANAGE,
         ResourceType.ALERTS: PermissionLevel.CAN_MANAGE,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_MANAGE,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
     },
     Persona.SUPPORT: {
@@ -111,6 +116,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_VIEW,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_VIEW,
         ResourceType.ALERTS: PermissionLevel.CAN_VIEW,
+        ResourceType.GENIE_SPACES: PermissionLevel.CAN_READ,
         ResourceType.TOKENS: PermissionLevel.NO_PERMISSIONS,
     },
 }

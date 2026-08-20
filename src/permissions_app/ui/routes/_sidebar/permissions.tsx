@@ -111,7 +111,7 @@ const RESOURCE_GROUPS: { name: string; types: string[] }[] = [
   },
   {
     name: "Analytics & BI",
-    types: ["warehouses", "dashboards", "alerts"],
+    types: ["warehouses", "dashboards", "alerts", "genie"],
   },
   {
     name: "Security",

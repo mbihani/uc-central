@@ -26,6 +26,7 @@ SUPPORTED_ACL_RESOURCE_TYPES: set[str] = {
     ResourceType.SERVING_ENDPOINTS.value,
     ResourceType.WAREHOUSES.value,
     ResourceType.DASHBOARDS.value,
+    ResourceType.GENIE_SPACES.value,
 }
 
 # MLflow experiment-kind tag. Notebook-backed experiments carry
@@ -218,6 +219,8 @@ def list_resources(
                 return _list_warehouses(ws)
             case ResourceType.DASHBOARDS:
                 return _list_dashboards(ws)
+            case ResourceType.GENIE_SPACES:
+                return _list_genie_spaces(ws)
             case _:
                 logger.warning(f"Unsupported resource type for listing: {resource_type}")
                 return []
@@ -394,4 +397,31 @@ def _list_dashboards(ws: WorkspaceClient) -> list[ResourceItemOut]:
             )
     except Exception as e:
         logger.warning(f"Could not list dashboards: {e}")
+    return items
+
+
+def _list_genie_spaces(ws: WorkspaceClient) -> list[ResourceItemOut]:
+    # `genie.list_spaces` is NOT an auto-paginating iterator (unlike the other
+    # `.list()` calls above): it returns one page + a `next_page_token`, so we
+    # loop until the token is empty to enumerate every space. The permissions API
+    # keys on the space's `space_id`. Guarded like dashboards/models so a
+    # workspace without Genie enabled degrades to an empty list instead of a 500.
+    items = []
+    try:
+        page_token: str | None = None
+        while True:
+            resp = ws.genie.list_spaces(page_token=page_token)
+            for s in resp.spaces or []:
+                items.append(
+                    ResourceItemOut(
+                        id=str(s.space_id),
+                        name=s.title or f"Genie Space {s.space_id}",
+                        resource_type=ResourceType.GENIE_SPACES,
+                    )
+                )
+            page_token = resp.next_page_token
+            if not page_token:
+                break
+    except Exception as e:
+        logger.warning(f"Could not list Genie spaces: {e}")
     return items

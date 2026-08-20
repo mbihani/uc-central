@@ -54,6 +54,10 @@ class ResourceType(str, Enum):
     DIRECTORIES = "directories"
     DASHBOARDS = "dashboards"
     ALERTS = "alerts"
+    # AI/BI Genie spaces. The permissions API object type is literally "genie"
+    # (verified against get_permission_levels), so the enum value doubles as the
+    # `request_object_type` passed straight to the ACL API.
+    GENIE_SPACES = "genie"
     TOKENS = "authorization"
 
 
@@ -72,6 +76,7 @@ RESOURCE_TYPE_LABELS: dict[ResourceType, str] = {
     ResourceType.DIRECTORIES: "Directories",
     ResourceType.DASHBOARDS: "Dashboards",
     ResourceType.ALERTS: "Alerts",
+    ResourceType.GENIE_SPACES: "Genie Spaces",
     ResourceType.TOKENS: "Tokens",
 }
 
@@ -181,6 +186,15 @@ RESOURCE_PERMISSION_LEVELS: dict[ResourceType, list[PermissionLevel]] = {
     ResourceType.ALERTS: [
         PermissionLevel.NO_PERMISSIONS,
         PermissionLevel.CAN_VIEW,
+        PermissionLevel.CAN_RUN,
+        PermissionLevel.CAN_EDIT,
+        PermissionLevel.CAN_MANAGE,
+    ],
+    # Genie spaces expose CAN_READ / CAN_RUN / CAN_EDIT / CAN_MANAGE (no CAN_VIEW);
+    # confirmed via permissions.get_permission_levels(request_object_type="genie").
+    ResourceType.GENIE_SPACES: [
+        PermissionLevel.NO_PERMISSIONS,
+        PermissionLevel.CAN_READ,
         PermissionLevel.CAN_RUN,
         PermissionLevel.CAN_EDIT,
         PermissionLevel.CAN_MANAGE,

@@ -123,6 +123,91 @@ def test_b1_direct_users_no_groups_acls_are_synced():
     )
 
 
+# ─── Genie spaces are a first-class, apply-able ACL resource type ────────────
+
+def test_genie_space_apply_pushes_group_acl_with_genie_object_type():
+    """Applying a persona whose template has a Genie-spaces level pushes the
+    ACL via apply_group_acl with resource_type == "genie" (the Databricks
+    permissions object type) — proving Genie is enumerated + written by the
+    apply path, not silently skipped as an unsupported type."""
+    persona = "analyst"
+    rt = ResourceType.GENIE_SPACES.value
+    assert rt == "genie"
+    level = PermissionLevel.CAN_RUN.value
+
+    templates = [_template(persona, rt, level)]
+    persona_def = _persona_def(persona)
+    group_mapping = _group_mapping(persona, "g1", "AnalystGroup")
+
+    def fake_session_exec(stmt):
+        result = MagicMock()
+        compiled = str(stmt)
+        if "persona_definition" in compiled:
+            result.first.return_value = persona_def
+            result.all.return_value = [persona_def]
+        elif "persona_group_mapping" in compiled:
+            result.all.return_value = [group_mapping]
+        elif "permission_template" in compiled:
+            result.all.return_value = templates
+        elif "persona_user_mapping" in compiled:
+            result.all.return_value = []
+        else:
+            result.all.return_value = []
+            result.first.return_value = None
+        return result
+
+    mock_session = MagicMock()
+    mock_session.exec.side_effect = fake_session_exec
+    mock_ws = MagicMock()
+
+    with (
+        patch(
+            "permissions_app.backend.router.list_resources",
+            return_value=[_make_resource("01f0genie", "FSI Genie Space")],
+        ),
+        patch("permissions_app.backend.router.apply_group_acl") as mock_group_acl,
+        patch("permissions_app.backend.router.apply_user_acl") as mock_user_acl,
+    ):
+        result = apply_permissions(
+            persona=persona,
+            obo_ws=mock_ws,
+            session=mock_session,
+        )
+
+    mock_group_acl.assert_called_once_with(
+        mock_ws, "genie", "01f0genie", {"AnalystGroup": level}
+    )
+    mock_user_acl.assert_not_called()
+    assert result.total_resources_updated == 1
+    assert result.total_errors == 0
+
+
+def test_genie_space_lister_paginates_and_maps_space_id_and_title():
+    """_list_genie_spaces walks next_page_token and maps each space's
+    space_id -> id / title -> name under the "genie" resource type."""
+    from permissions_app.backend.resources import list_resources
+
+    page1 = SimpleNamespace(
+        spaces=[SimpleNamespace(space_id="s1", title="Space One")],
+        next_page_token="tok2",
+    )
+    page2 = SimpleNamespace(
+        spaces=[SimpleNamespace(space_id="s2", title=None)],
+        next_page_token=None,
+    )
+
+    mock_ws = MagicMock()
+    mock_ws.genie.list_spaces.side_effect = [page1, page2]
+
+    items = list_resources(mock_ws, ResourceType.GENIE_SPACES.value)
+
+    assert [(i.id, i.name, i.resource_type) for i in items] == [
+        ("s1", "Space One", "genie"),
+        ("s2", "Genie Space s2", "genie"),  # None title falls back to a label
+    ]
+    assert mock_ws.genie.list_spaces.call_count == 2
+
+
 # ─── B2: ACL revoke fails → DB row NOT deleted ───────────────────────────────
 
 def test_b2_acl_revoke_failure_db_row_preserved():
