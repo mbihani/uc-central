@@ -40,7 +40,7 @@
         "@playwright/test": "^1.58.2",
         "@tailwindcss/vite": "^4.2.1",
         "@tanstack/react-router-devtools": "1.145.7",
-        "@tanstack/router-plugin": "^1.166.2",
+        "@tanstack/router-plugin": "1.166.2",
         "@types/node": "25.0.3",
         "@types/react": "19.2.7",
         "@types/react-dom": "19.2.3",
