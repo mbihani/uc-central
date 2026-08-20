@@ -77,6 +77,7 @@ const RESOURCE_TYPE_LABELS: Record<string, string> = {
   directories: "Directories",
   dashboards: "Dashboards",
   alerts: "Alerts",
+  genie: "Genie Spaces",
   authorization: "Tokens",
 };
 
@@ -96,6 +97,7 @@ const ALLOWED_PERMISSION_LEVELS: Record<string, string[]> = {
   directories: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   dashboards: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   alerts: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
+  genie: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   authorization: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE],
 };
 
@@ -112,6 +114,7 @@ const BROWSABLE_RESOURCE_TYPES = [
   ResourceType["serving-endpoints"],
   ResourceType.warehouses,
   ResourceType.dashboards,
+  ResourceType.genie,
 ];
 
 interface ResourcesSearchParams {

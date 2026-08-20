@@ -239,6 +239,7 @@ export const ResourceType = {
   directories: "directories",
   dashboards: "dashboards",
   alerts: "alerts",
+  genie: "genie",
   authorization: "authorization",
 } as const;
 
@@ -522,7 +523,7 @@ export function useListGroupsSuspense<TData = { data: GroupOut[] }>(options?: { 
 }
 
 export const getGroup = async (params: GetGroupParams, options?: RequestInit): Promise<{ data: GroupOut }> => {
-  const res = await fetch(`/api/groups/${params.group_id}`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/groups/${encodeURIComponent(String(params.group_id))}`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -545,7 +546,7 @@ export function useGetGroupSuspense<TData = { data: GroupOut }>(options: { param
 }
 
 export const addGroupMember = async (params: AddGroupMemberParams, data: AddMemberIn, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/groups/${params.group_id}/members`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  const res = await fetch(`/api/groups/${encodeURIComponent(String(params.group_id))}/members`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -560,7 +561,7 @@ export function useAddGroupMember(options?: { mutation?: UseMutationOptions<{ da
 }
 
 export const applyPermissions = async (params: ApplyPermissionsParams, data: ApplyPermissionsIn | null, options?: RequestInit): Promise<{ data: ApplyAllResultOut }> => {
-  const res = await fetch(`/api/permissions/apply/${params.persona}`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  const res = await fetch(`/api/permissions/apply/${encodeURIComponent(String(params.persona))}`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -575,7 +576,7 @@ export function useApplyPermissions(options?: { mutation?: UseMutationOptions<{ 
 }
 
 export const previewApplyPermissions = async (params: PreviewApplyPermissionsParams, options?: RequestInit): Promise<{ data: ApplyPreviewOut }> => {
-  const res = await fetch(`/api/permissions/apply/${params.persona}/preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/permissions/apply/${encodeURIComponent(String(params.persona))}/preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -712,7 +713,7 @@ export function useCreatePersonaMapping(options?: { mutation?: UseMutationOption
 }
 
 export const deletePersonaMapping = async (params: DeletePersonaMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/personas/mappings/${params.mapping_id}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/personas/mappings/${encodeURIComponent(String(params.mapping_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -742,7 +743,7 @@ export function useCreatePersonaUserMapping(options?: { mutation?: UseMutationOp
 }
 
 export const updatePersona = async (params: UpdatePersonaParams, data: PersonaDefinitionUpdateIn, options?: RequestInit): Promise<{ data: PersonaDefinitionOut }> => {
-  const res = await fetch(`/api/personas/${params.persona_key}`, { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  const res = await fetch(`/api/personas/${encodeURIComponent(String(params.persona_key))}`, { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -757,7 +758,7 @@ export function useUpdatePersona(options?: { mutation?: UseMutationOptions<{ dat
 }
 
 export const deletePersona = async (params: DeletePersonaParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/personas/${params.persona_key}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/personas/${encodeURIComponent(String(params.persona_key))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -772,7 +773,7 @@ export function useDeletePersona(options?: { mutation?: UseMutationOptions<{ dat
 }
 
 export const removePersonaMember = async (params: RemovePersonaMemberParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/personas/${params.persona}/members/${params.user_name}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/personas/${encodeURIComponent(String(params.persona))}/members/${encodeURIComponent(String(params.user_name))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -787,7 +788,7 @@ export function useRemovePersonaMember(options?: { mutation?: UseMutationOptions
 }
 
 export const listResourcesByType = async (params: ListResourcesByTypeParams, options?: RequestInit): Promise<{ data: ResourceItemOut[] }> => {
-  const res = await fetch(`/api/resources/${params.resource_type}`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/resources/${encodeURIComponent(String(params.resource_type))}`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -810,7 +811,7 @@ export function useListResourcesByTypeSuspense<TData = { data: ResourceItemOut[]
 }
 
 export const getPermissionLevels = async (params: GetPermissionLevelsParams, options?: RequestInit): Promise<{ data: PermissionLevelOut[] }> => {
-  const res = await fetch(`/api/resources/${params.resource_type}/${params.resource_id}/permission-levels`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/resources/${encodeURIComponent(String(params.resource_type))}/${encodeURIComponent(String(params.resource_id))}/permission-levels`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -833,7 +834,7 @@ export function useGetPermissionLevelsSuspense<TData = { data: PermissionLevelOu
 }
 
 export const getResourcePermissions = async (params: GetResourcePermissionsParams, options?: RequestInit): Promise<{ data: ResourcePermissionsOut }> => {
-  const res = await fetch(`/api/resources/${params.resource_type}/${params.resource_id}/permissions`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const res = await fetch(`/api/resources/${encodeURIComponent(String(params.resource_type))}/${encodeURIComponent(String(params.resource_id))}/permissions`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
@@ -856,7 +857,7 @@ export function useGetResourcePermissionsSuspense<TData = { data: ResourcePermis
 }
 
 export const setResourcePermissions = async (params: SetResourcePermissionsParams, data: SetPermissionIn[], options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
-  const res = await fetch(`/api/resources/${params.resource_type}/${params.resource_id}/permissions`, { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  const res = await fetch(`/api/resources/${encodeURIComponent(String(params.resource_type))}/${encodeURIComponent(String(params.resource_id))}/permissions`, { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
