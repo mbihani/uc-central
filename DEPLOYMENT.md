@@ -31,6 +31,27 @@ You will need:
 - A **workspace admin** account (you need admin + Postgres superuser to run the
   one-shot setup job — see below).
 
+### Install dependencies & configure (first clone)
+
+`node_modules/`, `.venv/`, and `.env` are intentionally **not** committed, so a
+fresh clone must create them before building:
+
+```bash
+bun install                 # JS/UI deps  -> node_modules/   (project uses bun)
+uv sync                     # Python deps -> .venv/
+cp .env.example .env        # sets PGAPPNAME for LOCAL builds/dev
+```
+
+> These are required even just to *build* the artifact: `apx build` loads the app
+> to generate its OpenAPI schema, and the app's config requires `PGAPPNAME` (read
+> from `.env`), so a build without `.env` fails with a `DatabaseConfig` /
+> `PGAPPNAME` validation error. In production the DB connection env
+> (`PGHOST`/`PGUSER`/`PGDATABASE`/`PGPORT`/`PGAPPNAME`) is injected by the Lakebase
+> `database` binding — `.env` only affects local build/dev.
+
+> **Note:** download the repo with `git clone` (not GitHub's "Download ZIP") — a
+> ZIP has no `.git`, so you can't pull updates or deploy-by-commit from it.
+
 ---
 
 ## ⚠️ The PG 16 requirement (read before deploying)
