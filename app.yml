@@ -1,1 +1,10 @@
 command: ["uvicorn", "permissions_app.backend.app:app", "--workers", "2"]
+# The app validates the Lakebase instance named by PGAPPNAME (config.py reads
+# it as db.instance_name). The Databricks Apps platform defaults PGAPPNAME to
+# the APP NAME; this env override aligns it with the bundle's `instance_name`
+# variable (databricks.yml) so app-name != instance-name does not crash the
+# app. If you change `instance_name` in databricks.yml, update this to match.
+# CONFIGURE(instance-name): MUST match `instance_name` in databricks.yml
+env:
+  - name: PGAPPNAME
+    value: "uc-central"

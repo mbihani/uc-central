@@ -6,7 +6,9 @@
 #   0. (once) pre-create the PG16 instance — see DEPLOYMENT.md (REQUIRED; the
 #      bundle cannot pin pg_version — see the instance_name variable below).
 #   1. databricks bundle deploy  -t dev --profile <your-profile>   # create the app + bind it
-#   2. databricks bundle run uc-central-setup -t dev --profile <your-profile>   # grant + SP-admin
+#   2. (operator, once) GRANT on schema public + add app SP to `admins` —
+#      see DEPLOYMENT.md Step 5. (Not an in-bundle job: serverless compute
+#      cannot reach the Lakebase endpoint.)
 #
 # See DEPLOYMENT.md for the full procedure and prerequisites.
 # See MANIFESTO.md for every configurable value in this bundle.
@@ -14,13 +16,12 @@ bundle:
   name: uc-central
   engine: direct          # Go-SDK deploy (requires Databricks CLI v1.3+)
 
-# Sync the pre-built app artifact (.build/) AND the one-shot setup notebook.
+# Sync the pre-built app artifact (.build/).
 # `.build/` is produced by the build step (vite build + apx build) — see
 # DEPLOYMENT.md. `bundle deploy` syncs the pre-built artifact (no build step).
 sync:
   include:
     - .build
-    - setup
 
 variables:
   app_name:
@@ -29,7 +30,9 @@ variables:
   instance_name:
     description: >-
       Name of the PRE-CREATED Lakebase Postgres 16 instance the app binds to
-      (becomes PGAPPNAME at runtime). Must exist before `bundle deploy` — the
+      (set as PGAPPNAME via the app's app.yml env block, which apx build copies
+      into .build/app.yml and the platform injects at deployment). Must exist
+      before `bundle deploy` — the
       bundle does NOT create or manage this instance. The database_instances
       resource cannot pin pg_version, and PG 17 breaks the app database
       binding's env injection, so create the instance via REST/CLI with
@@ -46,8 +49,11 @@ resources:
       description: "UC Central — permissions management"
       source_code_path: ./.build
       resources:
-        # Lakebase `database` binding: injects PGAPPNAME at runtime AND enrolls
-        # the app SP as a Postgres role (CAN_CONNECT_AND_CREATE) on the instance.
+        # Lakebase `database` binding: injects PGHOST/PGUSER/PGDATABASE/PGPORT
+        # at runtime AND enrolls the app SP as a Postgres role
+        # (CAN_CONNECT_AND_CREATE) on the instance. NOTE: the platform defaults
+        # PGAPPNAME to the APP NAME — the app's app.yml env block overrides
+        # PGAPPNAME to the instance_name (see app.yml and DEPLOYMENT.md).
         # instance_name is a plain variable (NOT a cross-resource ref) because the
         # PG16 instance is created OUTSIDE the bundle — see the variable comment
         # and DEPLOYMENT.md. This guarantees PG16 and keeps the instance lifecycle
@@ -57,39 +63,6 @@ resources:
             instance_name: ${var.instance_name}
             database_name: databricks_postgres  # CONFIGURE(database-name): Postgres database name (fixed by the app; also injected as PGDATABASE at runtime)
             permission: CAN_CONNECT_AND_CREATE
-
-  # --- One-shot setup job: the two non-declarative residues ------------------
-  # Run AFTER `bundle deploy` via `databricks bundle run uc-central-setup -t dev`.
-  # Automates (a) GRANT on schema public + (b) adding the app SP to `admins`.
-  # run_as is omitted → defaults to the deploying user (dev mode). That user MUST
-  # be a workspace admin (for the SCIM PATCH) AND a Postgres/DATABRICKS superuser
-  # on the instance (for the GRANT). See setup/grant.py for the idempotent,
-  # retry-hardened implementation.
-  #
-  # For a production target, set an explicit run_as (production bundles require
-  # it). Uncomment and set one of:
-  # CONFIGURE(production-run-as): the principal the setup job runs as in production
-  #     run_as:
-  #       service_principal_name: <your-sp>   # OR: user_name: <your-user>@...
-  jobs:
-    uc-central-setup:
-      name: "[${bundle.target}] uc-central setup (grant + SP-admin)"
-      environments:
-        - environment_key: setup_env
-          spec:
-            environment_version: "4"
-            dependencies:
-              - "psycopg[binary]"
-              - "databricks-sdk"
-      tasks:
-        - task_key: setup
-          notebook_task:
-            notebook_path: ./setup/grant.py
-            source: WORKSPACE
-            base_parameters:
-              app_name: ${var.app_name}
-              instance_name: ${var.instance_name}
-          environment_key: setup_env
 
 targets:
   dev:

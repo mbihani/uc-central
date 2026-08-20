@@ -61,7 +61,8 @@ Deploy to Databricks:
 
 ```bash
 databricks bundle deploy -t dev
-databricks bundle run uc-central-setup -t dev
+# then perform the one-time operator setup (GRANT on schema public + add the
+# app service principal to `admins`) — see DEPLOYMENT.md "Post-deploy setup".
 ```
 
 See **[DEPLOYMENT.md](./DEPLOYMENT.md)** for the full deployment guide
