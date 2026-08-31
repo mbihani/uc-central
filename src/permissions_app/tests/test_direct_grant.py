@@ -208,6 +208,82 @@ def test_genie_space_lister_paginates_and_maps_space_id_and_title():
     assert mock_ws.genie.list_spaces.call_count == 2
 
 
+# ─── Apps + Lakebase are apply-able ACL resource types (name-keyed) ──────────
+
+def test_apps_apply_pushes_group_acl_with_apps_object_type():
+    """Applying a persona with an Apps template level routes through
+    apply_group_acl with resource_type == "apps" (the Databricks object type)."""
+    persona = "analyst"
+    rt = ResourceType.APPS.value
+    assert rt == "apps"
+    level = PermissionLevel.CAN_USE.value
+
+    templates = [_template(persona, rt, level)]
+    persona_def = _persona_def(persona)
+    group_mapping = _group_mapping(persona, "g1", "AnalystGroup")
+
+    def fake_exec(stmt):
+        result = MagicMock()
+        compiled = str(stmt)
+        if "persona_definition" in compiled:
+            result.first.return_value = persona_def
+            result.all.return_value = [persona_def]
+        elif "persona_group_mapping" in compiled:
+            result.all.return_value = [group_mapping]
+        elif "permission_template" in compiled:
+            result.all.return_value = templates
+        elif "persona_user_mapping" in compiled:
+            result.all.return_value = []
+        else:
+            result.all.return_value = []
+            result.first.return_value = None
+        return result
+
+    mock_session = MagicMock()
+    mock_session.exec.side_effect = fake_exec
+    mock_ws = MagicMock()
+
+    with (
+        patch(
+            "permissions_app.backend.router.list_resources",
+            return_value=[_make_resource("my-app", "my-app")],
+        ),
+        patch("permissions_app.backend.router.apply_group_acl") as mock_group_acl,
+        patch("permissions_app.backend.router.apply_user_acl"),
+    ):
+        result = apply_permissions(persona=persona, obo_ws=mock_ws, session=mock_session)
+
+    mock_group_acl.assert_called_once_with(mock_ws, "apps", "my-app", {"AnalystGroup": level})
+    assert result.total_resources_updated == 1
+    assert result.total_errors == 0
+
+
+def test_apps_and_database_lister_key_permissions_on_name():
+    """Apps and Lakebase both key the permissions API on the NAME (not the opaque
+    id/uid), so both listers set ResourceItemOut.id == name."""
+    from permissions_app.backend.resources import list_resources
+
+    mock_ws = MagicMock()
+    mock_ws.apps.list.return_value = [
+        SimpleNamespace(name="app-one", id="uuid-1"),
+        SimpleNamespace(name="app-two", id="uuid-2"),
+    ]
+    apps = list_resources(mock_ws, ResourceType.APPS.value)
+    assert [(a.id, a.name, a.resource_type) for a in apps] == [
+        ("app-one", "app-one", "apps"),
+        ("app-two", "app-two", "apps"),
+    ]
+
+    mock_ws2 = MagicMock()
+    mock_ws2.database.list_database_instances.return_value = [
+        SimpleNamespace(name="lakebase-1", uid="uid-1"),
+    ]
+    dbs = list_resources(mock_ws2, ResourceType.DATABASE_INSTANCES.value)
+    assert [(d.id, d.name, d.resource_type) for d in dbs] == [
+        ("lakebase-1", "lakebase-1", "database-instances"),
+    ]
+
+
 # ─── B2: ACL revoke fails → DB row NOT deleted ───────────────────────────────
 
 def test_b2_acl_revoke_failure_db_row_preserved():

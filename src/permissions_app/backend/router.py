@@ -1048,6 +1048,34 @@ def get_permission_matrix(session: SessionDep, _admin: AdminRequired = True):
         _seed_permission_templates(session)
         templates = session.exec(select(PermissionTemplate)).all()
 
+    # Defensive backfill: guarantee EVERY persona has a cell for EVERY resource
+    # type, so the matrix always reflects (a) newly created personas — even if
+    # their create-time template seeding was incomplete — and (b) resource types
+    # added in a later release (e.g. Genie/Apps/Lakebase), for which pre-existing
+    # personas (custom ones especially) would otherwise have no row. Missing cells
+    # default to NO_PERMISSIONS. Runs a write ONLY when a gap actually exists
+    # (steady state: no write), and ON CONFLICT DO NOTHING keeps it idempotent and
+    # never overwrites an admin's chosen level.
+    existing_cells = {(t.persona, t.resource_type) for t in templates}
+    missing_rows = [
+        {
+            "persona": d.key,
+            "resource_type": rt.value,
+            "permission_level": PermissionLevel.NO_PERMISSIONS.value,
+        }
+        for d in definitions
+        for rt in ResourceType
+        if (d.key, rt.value) not in existing_cells
+    ]
+    if missing_rows:
+        session.execute(
+            pg_insert(PermissionTemplate.__table__)
+            .values(missing_rows)
+            .on_conflict_do_nothing(index_elements=["persona", "resource_type"])
+        )
+        session.commit()
+        templates = session.exec(select(PermissionTemplate)).all()
+
     matrix = [
         PermissionTemplateOut(
             id=t.id,  # type: ignore

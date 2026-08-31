@@ -240,6 +240,8 @@ export const ResourceType = {
   dashboards: "dashboards",
   alerts: "alerts",
   genie: "genie",
+  apps: "apps",
+  "database-instances": "database-instances",
   authorization: "authorization",
 } as const;
 

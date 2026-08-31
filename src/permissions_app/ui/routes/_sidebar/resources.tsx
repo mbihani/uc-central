@@ -78,6 +78,8 @@ const RESOURCE_TYPE_LABELS: Record<string, string> = {
   dashboards: "Dashboards",
   alerts: "Alerts",
   genie: "Genie Spaces",
+  apps: "Apps",
+  "database-instances": "Lakebase Instances",
   authorization: "Tokens",
 };
 
@@ -98,6 +100,8 @@ const ALLOWED_PERMISSION_LEVELS: Record<string, string[]> = {
   dashboards: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   alerts: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   genie: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
+  apps: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE, PermissionLevel.CAN_MANAGE],
+  "database-instances": [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE, PermissionLevel.CAN_MANAGE],
   authorization: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE],
 };
 
@@ -115,6 +119,8 @@ const BROWSABLE_RESOURCE_TYPES = [
   ResourceType.warehouses,
   ResourceType.dashboards,
   ResourceType.genie,
+  ResourceType.apps,
+  ResourceType["database-instances"],
 ];
 
 interface ResourcesSearchParams {

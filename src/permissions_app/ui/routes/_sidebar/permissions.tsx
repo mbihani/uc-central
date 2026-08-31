@@ -114,6 +114,10 @@ const RESOURCE_GROUPS: { name: string; types: string[] }[] = [
     types: ["warehouses", "dashboards", "alerts", "genie"],
   },
   {
+    name: "Apps & Databases",
+    types: ["apps", "database-instances"],
+  },
+  {
     name: "Security",
     types: ["authorization"],
   },
@@ -587,14 +591,19 @@ function PermissionsContent() {
           </div>
         </CardHeader>
         <CardContent>
-          <ScrollArea className="w-full">
-            <div className="min-w-[900px]">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-52 sticky left-0 bg-background z-10">
-                      Resource Group
-                    </TableHead>
+          {/* The shadcn Table wraps its <table> in its OWN `overflow-auto` div,
+              so that div is the horizontal scroll container. `min-w` goes on the
+              Table (not an outer wrapper) so the first column's `sticky left-0`
+              sticks against that same scroller — wrapping this in a ScrollArea
+              instead creates a second scroll container and the frozen column
+              breaks. */}
+          <div className="w-full">
+            <Table className="min-w-[900px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-52 sticky left-0 bg-background z-20">
+                    Resource Group
+                  </TableHead>
                     {matrix.personas.map((p) => (
                       <TableHead key={p} className="text-center min-w-[140px]">
                         <div className="flex flex-col items-center gap-1">
@@ -750,8 +759,7 @@ function PermissionsContent() {
                   })}
                 </TableBody>
               </Table>
-            </div>
-          </ScrollArea>
+          </div>
         </CardContent>
       </Card>
 
