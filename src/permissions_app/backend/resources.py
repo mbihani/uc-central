@@ -27,6 +27,8 @@ SUPPORTED_ACL_RESOURCE_TYPES: set[str] = {
     ResourceType.WAREHOUSES.value,
     ResourceType.DASHBOARDS.value,
     ResourceType.GENIE_SPACES.value,
+    ResourceType.APPS.value,
+    ResourceType.DATABASE_INSTANCES.value,
 }
 
 # MLflow experiment-kind tag. Notebook-backed experiments carry
@@ -221,6 +223,10 @@ def list_resources(
                 return _list_dashboards(ws)
             case ResourceType.GENIE_SPACES:
                 return _list_genie_spaces(ws)
+            case ResourceType.APPS:
+                return _list_apps(ws)
+            case ResourceType.DATABASE_INSTANCES:
+                return _list_database_instances(ws)
             case _:
                 logger.warning(f"Unsupported resource type for listing: {resource_type}")
                 return []
@@ -424,4 +430,44 @@ def _list_genie_spaces(ws: WorkspaceClient) -> list[ResourceItemOut]:
                 break
     except Exception as e:
         logger.warning(f"Could not list Genie spaces: {e}")
+    return items
+
+
+def _list_apps(ws: WorkspaceClient) -> list[ResourceItemOut]:
+    # The apps permissions API keys on the app NAME, not its opaque id/uuid —
+    # permissions.get(request_object_type="apps", request_object_id=<uuid>) is
+    # rejected with "App ... does not exist" (verified live), so both id and name
+    # here are the app name. Guarded like dashboards so a workspace with no apps
+    # (or no list permission) degrades to an empty list instead of a 500.
+    items = []
+    try:
+        for a in ws.apps.list():
+            items.append(
+                ResourceItemOut(
+                    id=str(a.name),
+                    name=a.name or f"App {a.name}",
+                    resource_type=ResourceType.APPS,
+                )
+            )
+    except Exception as e:
+        logger.warning(f"Could not list apps: {e}")
+    return items
+
+
+def _list_database_instances(ws: WorkspaceClient) -> list[ResourceItemOut]:
+    # Lakebase database instances. Like apps, the permissions API keys on the
+    # instance NAME (the uid is rejected by permissions.get), so id == name here.
+    # Guarded so a workspace without Lakebase enabled degrades to an empty list.
+    items = []
+    try:
+        for d in ws.database.list_database_instances():
+            items.append(
+                ResourceItemOut(
+                    id=str(d.name),
+                    name=d.name or f"Instance {d.name}",
+                    resource_type=ResourceType.DATABASE_INSTANCES,
+                )
+            )
+    except Exception as e:
+        logger.warning(f"Could not list database instances: {e}")
     return items

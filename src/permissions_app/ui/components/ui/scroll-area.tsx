@@ -17,7 +17,14 @@ const ScrollArea = React.forwardRef<
     <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
       {children}
     </ScrollAreaPrimitive.Viewport>
+    {/* Both orientations are registered so Radix enables native scrolling on
+        each axis (it sets the viewport's per-axis overflow from the scrollbars
+        that exist — with only a vertical bar, the horizontal axis stays
+        overflow:hidden and wide content like the resource-type tab strip and
+        the permissions matrix clips instead of scrolling). Each bar only
+        appears when its axis actually overflows. */}
     <ScrollBar />
+    <ScrollBar orientation="horizontal" />
     <ScrollAreaPrimitive.Corner />
   </ScrollAreaPrimitive.Root>
 ))

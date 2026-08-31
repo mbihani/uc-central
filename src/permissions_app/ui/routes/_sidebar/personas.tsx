@@ -130,9 +130,10 @@ function PersonasContent() {
           </h1>
           <p className="text-muted-foreground mt-1">
             Map Databricks workspace groups and users to personas. Adding a user
-            makes them a member of the persona's mapped groups, granting the
-            persona's permissions immediately — no Apply needed. (Use Apply on
-            the matrix only when you change a persona's permission template.)
+            grants the persona's permissions to that individual directly (per-user
+            ACLs) — no group required and no Apply needed. Mapping a group grants
+            the persona to every member of that group. (Use Apply on the matrix
+            only when you change a persona's permission template.)
           </p>
         </div>
         {isAdmin && (
@@ -294,7 +295,6 @@ function PersonaCard({
             <AddUserDialog
               persona={persona.persona}
               personaLabel={persona.label}
-              personaHasGroups={persona.groups.length > 0}
               availableUsers={availableUsers}
               onCreated={onChanged}
             />
@@ -386,13 +386,13 @@ function UserMappingBadge({
     mutation: {
       onSuccess: () => {
         toast.success(
-          `Removed ${label} — access revoked immediately (removed from the persona's mapped groups)`,
+          `Removed ${label} — per-user ACL entries revoked immediately (recomputed across any remaining direct assignments)`,
         );
         onRemoved();
       },
       onError: (error) => {
-        // On a partial failure the backend returns which group(s) still hold the
-        // user; the members list (SCIM-derived) will keep showing them there.
+        // On a partial failure the backend keeps the mapping row intact so a
+        // retry (or Apply) can recover; surface the detail for the operator.
         toast.error(`Failed to remove user: ${apiDetail(error)}`);
         onRemoved();
       },
@@ -415,7 +415,7 @@ function UserMappingBadge({
           size="icon"
           className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
           disabled={removeMember.isPending}
-          title="Remove from persona (revokes group membership immediately)"
+          title="Remove direct assignment (revokes this user's per-user ACLs immediately)"
           onClick={() => {
             removeMember.mutate({
               params: { persona: personaKey, user_name: userName ?? userId },
@@ -533,13 +533,11 @@ function AddGroupDialog({
 function AddUserDialog({
   persona,
   personaLabel,
-  personaHasGroups,
   availableUsers,
   onCreated,
 }: {
   persona: string;
   personaLabel: string;
-  personaHasGroups: boolean;
   availableUsers: UserOut[];
   onCreated: () => void;
 }) {
@@ -550,7 +548,7 @@ function AddUserDialog({
     mutation: {
       onSuccess: () => {
         toast.success(
-          "User added — access granted immediately via group membership (no Apply needed)",
+          "User added — persona permissions granted directly to this user (per-user ACLs; no group needed, no Apply)",
         );
         setOpen(false);
         setSelectedUser("");
@@ -580,19 +578,15 @@ function AddUserDialog({
         <DialogHeader>
           <DialogTitle>Add User to {personaLabel}</DialogTitle>
           <DialogDescription>
-            The user becomes a member of every workspace group mapped to the{" "}
-            <strong>{personaLabel}</strong> persona and inherits its permissions{" "}
-            <strong>immediately</strong> — no Apply or Refresh needed.
+            Grants the <strong>{personaLabel}</strong> persona's permissions to
+            this user directly, via per-user ACL entries on each resource —{" "}
+            <strong>immediately</strong>, with no Apply or Refresh needed. Works
+            whether or not the persona has any groups mapped, and the user's group
+            memberships are left unchanged.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 pt-4">
-          {!personaHasGroups ? (
-            <p className="text-sm text-muted-foreground">
-              This persona has no mapped groups yet, so adding a user would grant
-              no access. Map one or more workspace groups to{" "}
-              <strong>{personaLabel}</strong> first, then add users.
-            </p>
-          ) : availableUsers.length === 0 ? (
+          {availableUsers.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               All users are already directly mapped to personas.
             </p>
@@ -623,7 +617,6 @@ function AddUserDialog({
               disabled={
                 !selectedUser ||
                 createMapping.isPending ||
-                !personaHasGroups ||
                 availableUsers.length === 0
               }
               onClick={() => {

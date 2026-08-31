@@ -58,6 +58,12 @@ class ResourceType(str, Enum):
     # (verified against get_permission_levels), so the enum value doubles as the
     # `request_object_type` passed straight to the ACL API.
     GENIE_SPACES = "genie"
+    # Databricks Apps. Permissions API object type "apps"; the ACL API keys on the
+    # app NAME (its id/uuid is rejected by permissions.get), verified live.
+    APPS = "apps"
+    # Lakebase database instances. Permissions API object type "database-instances";
+    # like apps, the ACL API keys on the instance NAME (uid rejected), verified live.
+    DATABASE_INSTANCES = "database-instances"
     TOKENS = "authorization"
 
 
@@ -77,6 +83,8 @@ RESOURCE_TYPE_LABELS: dict[ResourceType, str] = {
     ResourceType.DASHBOARDS: "Dashboards",
     ResourceType.ALERTS: "Alerts",
     ResourceType.GENIE_SPACES: "Genie Spaces",
+    ResourceType.APPS: "Apps",
+    ResourceType.DATABASE_INSTANCES: "Lakebase Instances",
     ResourceType.TOKENS: "Tokens",
 }
 
@@ -197,6 +205,18 @@ RESOURCE_PERMISSION_LEVELS: dict[ResourceType, list[PermissionLevel]] = {
         PermissionLevel.CAN_READ,
         PermissionLevel.CAN_RUN,
         PermissionLevel.CAN_EDIT,
+        PermissionLevel.CAN_MANAGE,
+    ],
+    # Apps and Lakebase instances both expose only CAN_USE / CAN_MANAGE
+    # (confirmed via permissions.get_permission_levels), plus NO_PERMISSIONS for revoke.
+    ResourceType.APPS: [
+        PermissionLevel.NO_PERMISSIONS,
+        PermissionLevel.CAN_USE,
+        PermissionLevel.CAN_MANAGE,
+    ],
+    ResourceType.DATABASE_INSTANCES: [
+        PermissionLevel.NO_PERMISSIONS,
+        PermissionLevel.CAN_USE,
         PermissionLevel.CAN_MANAGE,
     ],
     ResourceType.TOKENS: [
