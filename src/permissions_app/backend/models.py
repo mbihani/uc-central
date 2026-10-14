@@ -186,7 +186,7 @@ RESOURCE_PERMISSION_LEVELS: dict[ResourceType, list[PermissionLevel]] = {
     ],
     ResourceType.DASHBOARDS: [
         PermissionLevel.NO_PERMISSIONS,
-        PermissionLevel.CAN_VIEW,
+        PermissionLevel.CAN_READ,
         PermissionLevel.CAN_RUN,
         PermissionLevel.CAN_EDIT,
         PermissionLevel.CAN_MANAGE,
@@ -242,6 +242,11 @@ def is_permission_level_allowed(resource_type: str, permission_level: str) -> bo
     """
     if permission_level == PermissionLevel.NO_PERMISSIONS.value:
         return True
+    if (
+        resource_type == ResourceType.DASHBOARDS.value
+        and permission_level == PermissionLevel.CAN_VIEW.value
+    ):
+        permission_level = PermissionLevel.CAN_READ.value
     try:
         rt = ResourceType(resource_type)
     except ValueError:

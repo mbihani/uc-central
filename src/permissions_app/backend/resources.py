@@ -39,6 +39,16 @@ _EXPERIMENT_TYPE_TAG = "mlflow.experimentType"
 _NOTEBOOK_EXPERIMENT_TYPE = "NOTEBOOK"
 
 
+def _normalize_permission_level(resource_type: str, level: str) -> str:
+    """Translate app-facing permission names to the workspace ACL API."""
+    if (
+        resource_type == ResourceType.DASHBOARDS.value
+        and level == PermissionLevel.CAN_VIEW.value
+    ):
+        return PermissionLevel.CAN_READ.value
+    return level
+
+
 def apply_group_acl(
     ws: WorkspaceClient,
     resource_type: str,
@@ -109,6 +119,7 @@ def apply_group_acl(
 
     # Apply the managed groups. NO_PERMISSIONS => omit => revoke.
     for group_name, level in group_levels.items():
+        level = _normalize_permission_level(resource_type, level)
         if level == PermissionLevel.NO_PERMISSIONS.value:
             continue
         merged.append(
@@ -177,6 +188,7 @@ def apply_user_acl(
             )
 
     for user_name, level in user_levels.items():
+        level = _normalize_permission_level(resource_type, level)
         if level == PermissionLevel.NO_PERMISSIONS.value:
             continue
         merged.append(
@@ -392,17 +404,18 @@ def _list_warehouses(ws: WorkspaceClient) -> list[ResourceItemOut]:
 
 def _list_dashboards(ws: WorkspaceClient) -> list[ResourceItemOut]:
     items = []
-    try:
-        for d in ws.dashboards.list():
-            items.append(
-                ResourceItemOut(
-                    id=str(d.id),
-                    name=d.name or f"Dashboard {d.id}",
-                    resource_type=ResourceType.DASHBOARDS,
-                )
+    # The SDK iterator follows Lakeview next-page tokens automatically.
+    for d in ws.lakeview.list():
+        lifecycle_state = getattr(d.lifecycle_state, "value", d.lifecycle_state)
+        if lifecycle_state == "TRASHED":
+            continue
+        items.append(
+            ResourceItemOut(
+                id=str(d.dashboard_id),
+                name=d.display_name or f"Dashboard {d.dashboard_id}",
+                resource_type=ResourceType.DASHBOARDS,
             )
-    except Exception as e:
-        logger.warning(f"Could not list dashboards: {e}")
+        )
     return items
 
 
