@@ -141,6 +141,7 @@ class Runtime:
         """
         from .seed import (
             BOOTSTRAP_LOCK_KEY,
+            ensure_genie_bundle_schema,
             ensure_unique_constraints,
             seed_defaults,
         )
@@ -155,5 +156,6 @@ class Runtime:
             )
             SQLModel.metadata.create_all(conn)
             ensure_unique_constraints(conn)
+            ensure_genie_bundle_schema(conn)
             seed_defaults(conn)
         logger.info("Database models initialized successfully")

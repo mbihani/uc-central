@@ -17,16 +17,21 @@ time; the ON CONFLICT seeding here is the belt-and-suspenders that keeps the
 lazy per-request seed paths (``router._seed_*``) safe as well.
 """
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, inspect, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlmodel import Session
+from sqlmodel import Session, SQLModel
 
 from .defaults import DEFAULT_PERMISSIONS_MATRIX
 from .logger import logger
 from .models import (
     DEFAULT_PERSONA_DESCRIPTIONS,
     DEFAULT_PERSONA_LABELS,
+    GENIE_BUNDLE_SPACE_UNIQUE,
+    GENIE_LEDGER_GROUP_ID_CHECK,
+    LEDGER_CONFIRMED,
     DefaultPersona,
+    GenieAccessBundle,
+    GenieGrantLedger,
     PermissionTemplate,
     PersonaDefinition,
 )
@@ -137,6 +142,129 @@ def ensure_unique_constraints(conn: Connection) -> None:
             )
         )
         logger.info(f"Added UNIQUE constraint {name} on {table}({', '.join(cols)})")
+
+
+def ensure_genie_bundle_schema(conn: Connection) -> None:
+    """Create / upgrade the Genie access bundle + grant ledger tables.
+
+    Idempotent, on a fresh database AND on one created by the first version of
+    this feature (which allowed several bundles per space and had no ledger
+    ``state`` column). Never drops or rewrites data:
+
+      * ``create_all(checkfirst=True)`` creates missing tables (fresh DB: with
+        every column and index already in place).
+      * ``genie_grant_ledger.state`` is ADDed if missing; existing rows were all
+        written after their grant succeeded, so they default to ``confirmed``.
+      * ``genie_grant_ledger.group_id`` (the lock / sharing key) is ADDed if
+        missing and backfilled from each row's bundle; its index is created.
+        If ANY row still has no group_id (its bundle is missing — there is no
+        FK to prevent that) the migration FAILS LOUDLY listing the row and
+        bundle ids, deleting nothing. On Postgres the transitional '' default is
+        then dropped and a non-empty CHECK added (fresh DBs get both from the
+        model).
+      * the one-bundle-per-space UNIQUE index is created if missing. If the DB
+        already holds several bundles for one space the migration FAILS LOUDLY
+        (RuntimeError, aborting startup) naming them, rather than silently
+        deleting a bundle whose grants are recorded in the ledger.
+    """
+    SQLModel.metadata.create_all(
+        conn,
+        tables=[
+            SQLModel.metadata.tables[GenieAccessBundle.__tablename__],
+            SQLModel.metadata.tables[GenieGrantLedger.__tablename__],
+        ],
+        checkfirst=True,
+    )
+    insp = inspect(conn)
+    ledger = GenieGrantLedger.__tablename__
+    bundles = GenieAccessBundle.__tablename__
+    if "state" not in {c["name"] for c in insp.get_columns(ledger)}:
+        conn.execute(
+            text(
+                f"ALTER TABLE {ledger} ADD COLUMN state VARCHAR NOT NULL "
+                f"DEFAULT '{LEDGER_CONFIRMED}'"
+            )
+        )
+        logger.info(f"Added column {ledger}.state")
+    if "group_id" not in {c["name"] for c in insp.get_columns(ledger)}:
+        conn.execute(
+            text(f"ALTER TABLE {ledger} ADD COLUMN group_id VARCHAR NOT NULL DEFAULT ''")
+        )
+        logger.info(f"Added column {ledger}.group_id")
+    # Backfill (idempotent: only rows still missing it) from the owning bundle.
+    backfilled = conn.execute(
+        text(
+            f"UPDATE {ledger} SET group_id = (SELECT b.group_id FROM "
+            f"{GenieAccessBundle.__tablename__} b WHERE b.id = {ledger}.bundle_id) "
+            f"WHERE (group_id IS NULL OR group_id = '') AND EXISTS (SELECT 1 FROM "
+            f"{GenieAccessBundle.__tablename__} b WHERE b.id = {ledger}.bundle_id)"
+        )
+    ).rowcount
+    if backfilled:
+        logger.info(f"Backfilled group_id on {backfilled} {ledger} row(s)")
+    # Rows that could not be backfilled (their bundle is gone — there is no
+    # foreign key preventing that) would lose their identity: they would share
+    # one lock / "still needed" key with every other such row and could never
+    # be revoked safely. Refuse to start instead of guessing or deleting.
+    unkeyed = conn.execute(
+        text(
+            f"SELECT l.id, l.bundle_id, "
+            f"(SELECT COUNT(*) FROM {bundles} b WHERE b.id = l.bundle_id) "
+            f"FROM {ledger} l WHERE l.group_id IS NULL OR l.group_id = '' ORDER BY l.id"
+        )
+    ).all()
+    if unkeyed:
+        detail = ", ".join(
+            f"row {r[0]} (bundle {r[1]}{'' if r[2] else ' — MISSING'})" for r in unkeyed
+        )
+        raise RuntimeError(
+            f"{len(unkeyed)} {ledger} row(s) have no group_id and could not be "
+            f"backfilled from their bundle: {detail}. Nothing was changed or deleted. "
+            f"These rows record grants the app may have made for a bundle that no "
+            f"longer exists; review them (and revoke the grants by hand if "
+            f"appropriate), then set group_id or remove the rows, and restart."
+        )
+    if conn.dialect.name == "postgresql":
+        # Existing PG databases: the column was added with a transitional ''
+        # default; make it strictly required like a fresh database.
+        conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN group_id DROP DEFAULT"))
+        has_check = conn.execute(
+            text("SELECT 1 FROM pg_constraint WHERE conname = :n"),
+            {"n": GENIE_LEDGER_GROUP_ID_CHECK},
+        ).first()
+        if not has_check:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {ledger} ADD CONSTRAINT {GENIE_LEDGER_GROUP_ID_CHECK} "
+                    f"CHECK (group_id <> '')"
+                )
+            )
+    conn.execute(
+        text(f"CREATE INDEX IF NOT EXISTS ix_{ledger}_group_id ON {ledger} (group_id)")
+    )
+
+    if GENIE_BUNDLE_SPACE_UNIQUE not in {i["name"] for i in insp.get_indexes(bundles)}:
+        dups = conn.execute(
+            text(
+                f"SELECT space_id, COUNT(*) FROM {bundles} "
+                f"GROUP BY space_id HAVING COUNT(*) > 1 ORDER BY space_id"
+            )
+        ).all()
+        if dups:
+            detail = "; ".join(f"space {d[0]}: {d[1]} bundles" for d in dups)
+            raise RuntimeError(
+                f"Cannot enforce one Genie access bundle per space: {detail}. "
+                f"Delete the extra bundle(s) through the app (DELETE "
+                f"/api/genie-bundles/<id>, which revokes their grants safely) on the "
+                f"previous version, then restart."
+            )
+        conn.execute(
+            text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {GENIE_BUNDLE_SPACE_UNIQUE} "
+                f"ON {bundles} (space_id)"
+            )
+        )
+        logger.info(f"Added UNIQUE index {GENIE_BUNDLE_SPACE_UNIQUE} on {bundles}(space_id)")
 
 
 def seed_defaults(conn: Connection) -> None:

@@ -28,6 +28,7 @@ class NoCacheHTMLStaticFiles(StaticFiles):
             response.headers.update(_NO_CACHE_HEADERS)
         return response
 from .config import AppConfig
+from .genie_bundle_routes import genie_bundles_api
 from .router import api
 from .runtime import Runtime
 from .utils import add_databricks_auth_handler, add_not_found_handler
@@ -67,6 +68,7 @@ ui = NoCacheHTMLStaticFiles(directory=dist_dir, html=True)
 
 # note the order of includes and mounts!
 app.include_router(api)
+app.include_router(genie_bundles_api)
 app.mount("/", ui)
 
 

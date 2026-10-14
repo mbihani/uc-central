@@ -1,11 +1,16 @@
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from .. import __version__
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
@@ -681,3 +686,183 @@ class PermissionConflictsOut(BaseModel):
     total_users_checked: int
     users_with_conflicts: int
     conflicts: list[UserPermissionConflict]
+
+
+# ─── Genie access bundles ────────────────────────────────────────────────────
+#
+# A bundle ties ONE Genie space to ONE pre-existing ACCOUNT-level group. Applying
+# it grants the group CAN_RUN on the space plus the per-table UC privileges the
+# space needs (SELECT on each table/view, USE_SCHEMA / USE_CATALOG on each
+# parent). Every privilege the bundle relies on is recorded in the grant ledger;
+# revocation is driven ONLY by the ledger, so the app never revokes a grant it
+# did not create. See docs/genie-access-bundles.md.
+
+
+GENIE_BUNDLE_SPACE_UNIQUE = "uq_genie_access_bundle_space_id"
+GENIE_LEDGER_GROUP_ID_CHECK = "ck_genie_grant_ledger_group_id_nonempty"
+
+# Grant-ledger row states. A PENDING row is written durably BEFORE the workspace
+# grant call and flipped to CONFIRMED after it, so a crash in between can be
+# reconciled instead of leaving an untracked app-created grant.
+LEDGER_PENDING = "pending"
+LEDGER_CONFIRMED = "confirmed"
+
+
+class GenieAccessBundle(SQLModel, table=True):
+    """One Genie space <-> one account group."""
+
+    __tablename__ = "genie_access_bundle"
+    # ONE group per space. A unique INDEX (not a table constraint) so the same
+    # DDL — CREATE UNIQUE INDEX IF NOT EXISTS — upgrades databases created before
+    # this rule existed (see seed.ensure_genie_bundle_schema).
+    __table_args__ = (
+        Index(GENIE_BUNDLE_SPACE_UNIQUE, "space_id", unique=True),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    space_id: str = Field(index=True)
+    space_title: str = ""
+    # group_id (immutable SCIM id) is the identity; group_name is the CURRENT
+    # display name, refreshed from group_id before every operation.
+    group_name: str = Field(index=True)
+    group_id: str = ""
+    created_by: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_applied_at: Optional[datetime] = None
+    last_applied_by: Optional[str] = None
+    # Reserved for the row/column restriction follow-up (docs/genie-access-
+    # bundles.md): "none" today; later e.g. "row_filter" or "abac". Nothing in
+    # this PR reads it beyond echoing it back.
+    restriction_mode: str = "none"
+
+
+class GenieGrantLedger(SQLModel, table=True):
+    """One privilege a bundle relies on, on one securable, for its group.
+
+    ``app_granted`` is True when THIS app issued the grant (or inherited
+    ownership of an app-issued grant from a deleted bundle). Rows with
+    ``app_granted=False`` record a privilege that already existed when the
+    bundle was applied: they mark the privilege as "needed" (so another bundle
+    never revokes it out from under this one) but are never revoked themselves.
+    """
+
+    __tablename__ = "genie_grant_ledger"
+    __table_args__ = (
+        UniqueConstraint(
+            "bundle_id",
+            "principal",
+            "securable_type",
+            "full_name",
+            "privilege",
+            name="uq_genie_grant_ledger_bundle_grant",
+        ),
+        # group_id is the identity / lock / sharing key: never empty. (NOT NULL
+        # comes from the required field below.) There is NO foreign key to
+        # genie_access_bundle, so seed.ensure_genie_bundle_schema also refuses
+        # to start if any row lacks it.
+        CheckConstraint("group_id <> ''", name=GENIE_LEDGER_GROUP_ID_CHECK),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    bundle_id: int = Field(index=True)
+    # Immutable SCIM id of the bundle's group: the key for per-grant locks and
+    # for "does another bundle still need this grant?". ``principal`` is the
+    # group's display name as last seen (informational; UC calls re-resolve it).
+    group_id: str = Field(index=True, nullable=False)  # REQUIRED: no default
+    space_id: str = Field(index=True)
+    principal: str = Field(index=True)
+    # "genie_space" (ACL CAN_RUN) or a UC securable type: catalog/schema/table/volume.
+    securable_type: str
+    full_name: str = Field(index=True)
+    privilege: str
+    app_granted: bool = Field(default=True)
+    state: str = Field(default=LEDGER_CONFIRMED)  # LEDGER_PENDING | LEDGER_CONFIRMED
+    granted_at: datetime = Field(default_factory=_utcnow)
+    granted_by: str = ""
+
+
+class GenieBundleIn(BaseModel):
+    space_id: str
+    group_name: str
+
+
+class GenieBundleOut(BaseModel):
+    id: int
+    space_id: str
+    space_title: str
+    group_name: str
+    group_id: str
+    created_by: str
+    created_at: datetime
+    last_applied_at: Optional[datetime] = None
+    last_applied_by: Optional[str] = None
+    restriction_mode: str = "none"
+    ledger_count: int = 0
+
+
+class GenieGroupCheckOut(BaseModel):
+    group_name: str
+    group_id: Optional[str] = None
+    exists: bool
+    is_account_group: bool
+    # SCIM meta.resourceType: "Group" (account group) or "WorkspaceGroup".
+    resource_type: Optional[str] = None
+    error: Optional[str] = None
+    # Set when the group (same SCIM id) now has a different display name than
+    # the bundle recorded. Preview only reports it; mutating paths persist it.
+    renamed_from: Optional[str] = None
+
+
+class GenieSpaceObjectOut(BaseModel):
+    """A data source referenced by the space's serialized definition."""
+
+    kind: str  # "table" (tables, views, MVs, metric views) or "volume"
+    identifier: str  # as written in the serialized space
+    full_name: Optional[str] = None  # resolved catalog.schema.name
+    table_type: Optional[str] = None  # MANAGED / VIEW / METRIC_VIEW / ...
+    resolved: bool
+    reason: Optional[str] = None  # why it could not be resolved
+    has_row_filter: bool = False
+    row_filter_function: Optional[str] = None
+    masked_columns: list[str] = []
+
+
+class GenieGrantOut(BaseModel):
+    securable_type: str
+    full_name: str
+    privilege: str
+    # missing      — would be / was granted by this bundle
+    # present      — already effective, not created by the app (never revoked)
+    # managed      — already effective AND owned by the app's ledger
+    # stale        — in this bundle's ledger but no longer needed (resync drops it)
+    status: str
+    detail: Optional[str] = None
+
+
+class GenieBundlePreviewOut(BaseModel):
+    bundle_id: int
+    space_id: str
+    space_title: str
+    warehouse_id: Optional[str] = None
+    group: GenieGroupCheckOut
+    objects: list[GenieSpaceObjectOut]
+    grants: list[GenieGrantOut]
+    stale_grants: list[GenieGrantOut] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    can_apply: bool
+
+
+class GenieBundleActionOut(BaseModel):
+    bundle_id: int
+    action: str  # apply | resync | delete
+    status: str  # ok | partial | failed
+    granted: list[GenieGrantOut] = []
+    adopted: list[GenieGrantOut] = []
+    revoked: list[GenieGrantOut] = []
+    released: list[GenieGrantOut] = []
+    # PENDING rows from an interrupted run, confirmed or dropped this run.
+    reconciled: list[GenieGrantOut] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    deleted: bool = False
