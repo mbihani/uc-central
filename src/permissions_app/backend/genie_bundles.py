@@ -383,9 +383,17 @@ def check_group(ws: WorkspaceClient, group_name: str) -> GenieGroupCheckOut:
 
 
 def resolve_bundle_group(
-    ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
+    ws: WorkspaceClient,
+    session: Session,
+    bundle: GenieAccessBundle,
+    *,
+    persist_rename: bool,
 ) -> GenieGroupCheckOut:
     """Resolve the bundle's group by its immutable SCIM id — never by name.
+
+    ``persist_rename=False`` (preview) is WRITE-FREE: a detected rename is only
+    reported (``renamed_from``). Mutating paths (apply / resync / delete /
+    membership) pass True and the rename is propagated to the app's records.
 
     Run before every preview / apply / resync / delete / membership operation:
 
@@ -443,7 +451,8 @@ def resolve_bundle_group(
                 + "; Unity Catalog can only grant to ACCOUNT-level groups."
             ),
         )
-    if current != bundle.group_name:
+    renamed_from = bundle.group_name if current != bundle.group_name else None
+    if renamed_from is not None and persist_rename:
         _rename_principal(session, bundle, current)
     return GenieGroupCheckOut(
         group_name=current,
@@ -451,6 +460,7 @@ def resolve_bundle_group(
         exists=True,
         is_account_group=True,
         resource_type=resource_type,
+        renamed_from=renamed_from,
     )
 
 
@@ -521,7 +531,7 @@ _LOCAL_LOCKS_GUARD = threading.Lock()
 
 
 def grant_lock_key(principal: str, key: GrantKey) -> int:
-    """Stable signed 64-bit key for ``pg_advisory_xact_lock`` (same on every
+    """Stable signed 64-bit key for ``pg_advisory_lock`` (same on every
     worker/process, unlike ``hash()``)."""
     raw = "\x1f".join(
         ["genie-grant", principal, key.securable_type, key.full_name, key.privilege]
@@ -529,34 +539,64 @@ def grant_lock_key(principal: str, key: GrantKey) -> int:
     return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
 
 
+_HELD_LOCKS = "genie_grant_locks_held"
+
+
 @contextmanager
 def _grant_lock(session: Session, principal: str, key: GrantKey) -> Iterator[None]:
-    """Hold the per-grant lock for the duration of ONE transaction.
+    """Hold the per-grant lock across the WHOLE block — including commits and
+    workspace calls inside it.
 
-    Postgres (production): ``pg_advisory_xact_lock`` — cross-worker, released
-    automatically when the transaction commits or rolls back, so the body must
-    finish its decision with ``session.commit()``. Other dialects (SQLite in
-    tests / local dev): a process-local lock with the same scope. Anything left
-    uncommitted when the body exits (e.g. on error) is rolled back, so the lock
-    is never held past the block.
+    Postgres (production): a SESSION-level ``pg_advisory_lock`` taken on a
+    DEDICATED pooled connection (not the ORM session's), so the body can commit
+    as often as it needs to (e.g. pending row -> grant call -> confirm) while
+    the lock stays held. ``pg_advisory_unlock`` always runs in ``finally``; if
+    the unlock itself fails the lock connection is invalidated (its backend is
+    closed, which releases the lock) instead of going back to the pool still
+    holding it. Other dialects (SQLite in tests / local dev): a process-local
+    lock with the same scope.
+
+    Deadlock safety: an operation holds at most one grant lock at a time today;
+    if a caller ever nests them, keys must be taken in ascending order, which is
+    enforced here (RuntimeError otherwise).
     """
     k = grant_lock_key(principal, key)
-    if session.get_bind().dialect.name == "postgresql":
-        try:
-            session.connection().execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": k})
-            yield
-        finally:
-            if session.in_transaction():
-                session.rollback()
-        return
-    with _LOCAL_LOCKS_GUARD:
-        lock = _LOCAL_LOCKS.setdefault(k, threading.Lock())
-    with lock:
-        try:
-            yield
-        finally:
-            if session.in_transaction():
-                session.rollback()
+    held: list[int] = session.info.setdefault(_HELD_LOCKS, [])
+    if held and k <= max(held):
+        raise RuntimeError("Grant locks must be acquired in ascending key order.")
+    if session.in_transaction():
+        # Start the locked section on a fresh transaction (callers have already
+        # committed their work; this just ends any read-only snapshot).
+        session.commit()
+    held.append(k)
+    try:
+        engine = session.get_bind().engine
+        if engine.dialect.name == "postgresql":
+            with engine.connect() as lock_conn:
+                lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": k})
+                lock_conn.commit()
+                try:
+                    yield
+                finally:
+                    if session.in_transaction():
+                        session.rollback()
+                    try:
+                        lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": k})
+                        lock_conn.commit()
+                    except Exception:
+                        lock_conn.invalidate()
+                        raise
+            return
+        with _LOCAL_LOCKS_GUARD:
+            lock = _LOCAL_LOCKS.setdefault(k, threading.Lock())
+        with lock:
+            try:
+                yield
+            finally:
+                if session.in_transaction():
+                    session.rollback()
+    finally:
+        held.remove(k)
 
 
 # ─── Ledger helpers ──────────────────────────────────────────────────────────
@@ -683,16 +723,35 @@ def _is_present(
 
 
 def build_plan(
-    ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
+    ws: WorkspaceClient,
+    session: Session,
+    bundle: GenieAccessBundle,
+    *,
+    persist_rename: bool,
 ) -> BundlePlan:
-    """Compute everything the preview shows. No workspace writes; the only DB
-    write is a rename of the bundle's group records (see resolve_bundle_group)."""
+    """Compute everything the preview shows. Never writes to the workspace.
+
+    With ``persist_rename=False`` (preview) it performs NO database writes
+    either: a group rename is detected and reported, and the ledger is read
+    under the stored (old) principal name. apply / resync pass True so the
+    rename is propagated before anything is granted.
+    """
     plan = BundlePlan(space_title=bundle.space_title)
 
-    plan.group = resolve_bundle_group(ws, session, bundle)
+    # Captured BEFORE resolution: the name the ledger rows currently carry.
+    ledger_principal = bundle.group_name
+    plan.group = resolve_bundle_group(ws, session, bundle, persist_rename=persist_rename)
     if plan.group.error:
         plan.blockers.append(plan.group.error)
-    principal = plan.group.group_name
+    principal = plan.group.group_name  # CURRENT name: what UC grants use
+    if persist_rename:
+        ledger_principal = principal
+    if plan.group.renamed_from and not persist_rename:
+        plan.warnings.append(
+            f"Group id {bundle.group_id} was renamed '{plan.group.renamed_from}' -> "
+            f"'{principal}'. Grants follow the group; UC Central's records are updated "
+            f"on the next apply / resync / delete / membership change."
+        )
 
     serialized: str | None = None
     try:
@@ -782,7 +841,7 @@ def build_plan(
             continue
         if not present:
             plan.evaluated.append(_Evaluated(key, "missing", detail))
-        elif any(r.app_granted for r in _ledger_for_grant(session, principal, key)):
+        elif any(r.app_granted for r in _ledger_for_grant(session, ledger_principal, key)):
             plan.evaluated.append(_Evaluated(key, "managed", detail))
         else:
             plan.evaluated.append(_Evaluated(key, "present", detail))
@@ -831,13 +890,25 @@ def reconcile_pending(
     principal: str,
     result: GenieBundleActionOut,
 ) -> None:
-    """Resolve PENDING rows left by an apply that died between writing the
-    pending row and confirming it (crash, DB failure after the grant call).
+    """Resolve PENDING rows left behind by an apply that died mid-grant.
 
-    Under the per-grant lock: if the privilege is effective now, the grant went
-    through — CONFIRM the row (app-granted, so it stays revocable). If it is not,
-    the grant never happened — DROP the row. If the workspace cannot be read the
-    row stays pending and the error is reported.
+    Every apply holds the per-grant lock from writing the pending row through
+    the workspace call to the confirm/rollback, and this function takes the
+    same lock — so it can never touch a row whose grant is still in flight. A
+    pending row seen here therefore means the process crashed (or its DB
+    connection died) somewhere inside that window, and the outcome is
+    ambiguous: the app may or may not have issued the grant, and someone else
+    could have granted the same privilege meanwhile.
+
+    The rule is CONSERVATIVE:
+      * privilege effective now -> keep the row, CONFIRMED, with its
+        ``app_granted`` flag UNCHANGED. Pending rows are written with the flag
+        the row had before the attempt (False for a new row), so an ambiguous
+        grant is recorded as "needed" but is NEVER auto-revoked. It is reported
+        so an operator can review it.
+      * privilege not effective -> the grant never happened: DROP the row (the
+        apply that follows grants it normally).
+      * workspace unreadable -> leave it pending and report the error.
     """
     for row in _ledger_for_bundle(session, bundle.id or 0):
         if row.state != LEDGER_PENDING:
@@ -852,10 +923,21 @@ def reconcile_pending(
                 present, _ = _is_present(ws, principal, key)
                 if present:
                     own.state = LEDGER_CONFIRMED
-                    own.app_granted = True
                     session.add(own)
                     session.commit()
-                    result.reconciled.append(_grant_out(key, "confirmed", "pending grant was applied"))
+                    detail = (
+                        "in effect; app-granted before this attempt, stays revocable"
+                        if own.app_granted
+                        else "in effect but the app cannot prove it issued it after a "
+                        "crash: recorded as needed, NOT app-granted (never auto-revoked)"
+                    )
+                    result.reconciled.append(_grant_out(key, "confirmed", detail))
+                    if not own.app_granted:
+                        result.warnings.append(
+                            f"Review {key.privilege} on {key.securable_type} "
+                            f"'{key.full_name}' for '{principal}': an interrupted apply may "
+                            f"have granted it; UC Central will not revoke it automatically."
+                        )
                 else:
                     session.delete(own)
                     session.commit()
@@ -875,12 +957,13 @@ def apply_plan(
 ) -> GenieBundleActionOut:
     """Grant what is missing and record every required privilege in the ledger.
 
-    Each grant is decided under its per-grant lock with a FRESH presence check
-    (the plan is advisory). A missing grant is recorded as a durable PENDING
-    row BEFORE the workspace call and CONFIRMED after it, so a crash in between
-    leaves a row that ``reconcile_pending`` resolves on the next run instead of
-    an untracked app-created grant. Idempotent: a second run makes no grant
-    calls. With ``revoke_stale`` (resync) rows no longer needed are released.
+    Each grant runs under ONE continuous per-grant lock span: fresh presence
+    check -> durable PENDING row (committed) -> workspace grant -> CONFIRMED
+    (``app_granted=True``) or rolled back. Delete / resync / reconcile take the
+    same lock, so none of them can act on a pending row while its grant is in
+    flight. A crash inside the span leaves a pending row for
+    ``reconcile_pending``. Idempotent: a second run makes no grant calls. With
+    ``revoke_stale`` (resync) rows no longer needed are released.
     """
     result = GenieBundleActionOut(
         bundle_id=bundle.id or 0,
@@ -899,50 +982,52 @@ def apply_plan(
             result.errors.append(ev.detail or f"Could not evaluate {ev.key}.")
             continue
         key = ev.key
-        try:
-            with _grant_lock(session, principal, key):
-                own = _own_row(session, bundle_id, principal, key)
-                present, detail = _is_present(ws, principal, key)
-                if present:
-                    # Already effective: record that this bundle relies on it,
-                    # without taking ownership — only app-issued grants are revoked.
-                    if own is None:
-                        session.add(_new_row(bundle, principal, key, actor, app_granted=False))
-                        result.adopted.append(_grant_out(key, ev.status, detail))
-                    session.commit()
-                    continue
-                previous = (own.app_granted, own.state) if own is not None else None
-                if own is None:
-                    own = _new_row(bundle, principal, key, actor, app_granted=True)
-                own.app_granted = True
-                own.state = LEDGER_PENDING
-                session.add(own)
-                _commit(session)  # durable BEFORE the workspace call
-                row_id = own.id
-        except UCGrantError as e:
-            result.errors.append(str(e))
-            continue
-        if row_id is None:
-            # The expected UNIQUE conflict: a concurrent run recorded this exact
-            # row first. Do not grant without our own durable record; retry.
-            result.errors.append(
-                f"Grant {key.privilege} on {key.securable_type} '{key.full_name}' was "
-                f"recorded concurrently by another run; re-run apply."
-            )
-            continue
-
-        try:
-            _grant(ws, principal, key)
-            granted_error: UCGrantError | None = None
-        except UCGrantError as e:
-            logger.error(f"Genie bundle {bundle_id}: {e}")
-            granted_error = e
-
         with _grant_lock(session, principal, key):
+            own = _own_row(session, bundle_id, principal, key)
+            try:
+                present, detail = _is_present(ws, principal, key)
+            except UCGrantError as e:
+                result.errors.append(str(e))
+                continue
+            if present:
+                # Already effective: record that this bundle relies on it,
+                # without taking ownership — only app-issued grants are revoked.
+                if own is None:
+                    session.add(_new_row(bundle, principal, key, actor, app_granted=False))
+                    result.adopted.append(_grant_out(key, ev.status, detail))
+                _commit(session)
+                continue
+
+            previous = (own.app_granted, own.state) if own is not None else None
+            if own is None:
+                # app_granted stays False until the grant is CONFIRMED below, so
+                # a crash can never leave an unproven row marked app-granted.
+                own = _new_row(bundle, principal, key, actor, app_granted=False)
+            own.state = LEDGER_PENDING
+            session.add(own)
+            _commit(session)  # durable BEFORE the workspace call
+            row_id = own.id
+            if row_id is None:
+                # The expected UNIQUE conflict: another run recorded this exact
+                # row first. Never grant without our own durable record.
+                result.errors.append(
+                    f"Grant {key.privilege} on {key.securable_type} '{key.full_name}' "
+                    f"was recorded concurrently by another run; re-run apply."
+                )
+                continue
+
+            granted_error: UCGrantError | None = None
+            try:
+                _grant(ws, principal, key)
+            except UCGrantError as e:
+                logger.error(f"Genie bundle {bundle_id}: {e}")
+                granted_error = e
+
             row = session.get(GenieGrantLedger, row_id, populate_existing=True)
             if row is not None:
                 if granted_error is None:
                     row.state = LEDGER_CONFIRMED
+                    row.app_granted = True  # proven: this process just issued it
                     session.add(row)
                 elif previous is not None:
                     row.app_granted, row.state = previous
@@ -1097,7 +1182,7 @@ def delete_bundle(
     the space can get a new bundle. The deleted principal's privileges cannot
     be revoked by name safely; they are listed in the result for audit.
     """
-    group = resolve_bundle_group(ws, session, bundle)
+    group = resolve_bundle_group(ws, session, bundle, persist_rename=True)
     if group.error and forget_orphaned:
         return _forget_orphaned(ws, session, bundle)
     if group.error:

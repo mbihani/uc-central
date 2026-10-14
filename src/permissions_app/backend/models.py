@@ -798,6 +798,9 @@ class GenieGroupCheckOut(BaseModel):
     # SCIM meta.resourceType: "Group" (account group) or "WorkspaceGroup".
     resource_type: Optional[str] = None
     error: Optional[str] = None
+    # Set when the group (same SCIM id) now has a different display name than
+    # the bundle recorded. Preview only reports it; mutating paths persist it.
+    renamed_from: Optional[str] = None
 
 
 class GenieSpaceObjectOut(BaseModel):

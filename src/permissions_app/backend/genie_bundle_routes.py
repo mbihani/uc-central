@@ -80,7 +80,7 @@ def _verified_bundle(
     """Load the bundle and re-verify its group BY ID (renames are picked up;
     a deleted / non-account group blocks the request with a 400)."""
     bundle = _get_bundle(session, bundle_id)
-    group = resolve_bundle_group(obo_ws, session, bundle)
+    group = resolve_bundle_group(obo_ws, session, bundle, persist_rename=True)
     if group.error:
         raise HTTPException(status_code=400, detail=group.error)
     return bundle
@@ -172,9 +172,10 @@ def preview_genie_bundle(
     _admin: AdminRequired = True,
 ):
     """Read-only plan: tables, required grants, what already exists, row
-    filter / mask status, group validity and blockers. No writes."""
+    filter / mask status, group validity and blockers. No workspace or
+    database writes (a group rename is reported, not persisted)."""
     bundle = _get_bundle(session, bundle_id)
-    return to_preview(bundle, build_plan(obo_ws, session, bundle))
+    return to_preview(bundle, build_plan(obo_ws, session, bundle, persist_rename=False))
 
 
 def _run(
@@ -186,7 +187,7 @@ def _run(
     revoke_stale: bool,
 ) -> GenieBundleActionOut:
     bundle = _get_bundle(session, bundle_id)
-    plan = build_plan(obo_ws, session, bundle)
+    plan = build_plan(obo_ws, session, bundle, persist_rename=True)
     if plan.blockers:
         raise HTTPException(status_code=400, detail=" ".join(plan.blockers))
     result = apply_plan(obo_ws, session, bundle, plan, actor, revoke_stale=revoke_stale)

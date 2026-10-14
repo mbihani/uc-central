@@ -125,6 +125,7 @@ export interface GenieGroupCheckOut {
   group_id?: string | null;
   group_name: string;
   is_account_group: boolean;
+  renamed_from?: string | null;
   resource_type?: string | null;
 }
 

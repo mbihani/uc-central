@@ -53,6 +53,11 @@ create ─▶ preview ─▶ apply ─▶ (add members) ─▶ resync … ─▶
     * `error`: the grants couldn't be read.
   * ledger rows that are no longer needed (`stale`, released on resync);
   * the group check, plus any **blockers** and warnings.
+
+  Preview makes **no workspace writes and no database writes**. If the group
+  was renamed, the preview reports it (`group.renamed_from` plus a warning)
+  and evaluates grants under the current name. The rename is only *persisted*
+  by apply, resync, delete or a membership change.
 * **Apply** (`POST …/apply`): grants `CAN_RUN` on the space, then the missing
   UC privileges (parents first). Apply is idempotent: a second apply makes no
   API calls.
@@ -140,35 +145,60 @@ out from under this one**, but the app never revokes it itself.
 
 ### Grant-before-ledger: pending rows
 
-A grant the app is about to make is recorded first, as a durable **`pending`**
-row committed *before* the workspace call. It is flipped to **`confirmed`**
-after the call succeeds. If the call fails, the row is restored or removed.
-After a crash or DB failure between the grant and the confirmation, the next
-apply/resync/delete **reconciles** every pending row of the bundle against the
-workspace's effective grants:
+Every grant the app makes runs inside **one continuous per-grant lock span**:
 
-* if the privilege is effective, the row is **confirmed** (app-granted, so it
-  stays revocable);
-* if it isn't, the row is **dropped** and apply grants it again normally.
+1. Fresh presence check.
+2. A durable **`pending`** ledger row is committed *before* the workspace call.
+   A new row is written with `app_granted = false`.
+3. The workspace grant call.
+4. On success, the row becomes **`confirmed`** with `app_granted = true`; this
+   process provably issued the grant. On failure, the row is restored to its
+   previous state, or removed.
 
-Reconciled rows are reported in the response (`reconciled`), and the preview
-warns when pending rows exist. Reconciliation can't tell "our grant went
-through" apart from "someone else made the same grant in that window". It
-treats the privilege as ours, which errs on the side of never orphaning an
-app-made grant. While a row is pending, it counts as "still needed" for every
-other bundle.
+Delete, resync and reconciliation take the **same lock**, so none of them can
+act on a pending row while its grant is in flight. A pending row that one of
+them does see therefore means the applying process **crashed** (or lost its
+DB connection) inside that span. That is ambiguous: the grant may or may not
+have been issued, and someone else may have granted the same privilege
+meanwhile.
+
+**Reconciliation rule (conservative).** At the start of every apply, resync
+and delete, each pending row of the bundle is checked against the
+workspace's effective grants, under the lock:
+
+* **Privilege in effect:** the row is confirmed, and its `app_granted` flag is
+  left **unchanged**. A row first created by the interrupted attempt stays
+  `app_granted = false`: it is recorded as *needed* but is **never revoked
+  automatically**. The response lists it under `reconciled` with a warning so
+  an operator can review it and revoke it by hand if appropriate. A row that
+  was already app-granted before the attempt (proven earlier, then revoked
+  externally and re-granted) keeps `app_granted = true`.
+* **Privilege not in effect:** the grant never happened, so the row is
+  **dropped** and apply grants it again normally.
+* **Workspace unreadable:** the row stays pending and an error is reported.
+
+The preview warns whenever pending rows exist.
 
 ### Safe revoke (resync / delete)
 
-Every decision about one grant runs under a **per-grant lock**: a Postgres
-`pg_advisory_xact_lock`, keyed on a stable 64-bit hash of (principal,
-securable type, full name, privilege). Within one transaction, the app
-re-reads the other bundles' rows, drops its own row, and revokes if it was the
-last user. Two bundles sharing a table, schema or catalog grant can therefore
-be deleted or resynced concurrently without both concluding "the other one
-still needs it" and orphaning the grant. Apply takes the same lock and
-re-checks presence under it. On non-Postgres databases (the SQLite used in
-tests), a process-local lock is used instead.
+Every decision about one grant runs under a **per-grant lock** keyed on a
+stable 64-bit hash of (principal, securable type, full name, privilege).
+On Postgres this is a **session-level `pg_advisory_lock`** taken on a
+dedicated pooled connection. It stays held across the commits and workspace
+calls inside the span, and is released with `pg_advisory_unlock` in a
+`finally`. If the unlock itself fails, the lock connection is invalidated, so
+its backend closes and the lock is freed rather than returned to the pool
+still held. On other databases (the SQLite used in tests), a process-local
+lock is used.
+
+Within the lock, the app re-reads the other bundles' rows, drops its own row,
+and revokes if it was the last user. Two bundles sharing a table, schema or
+catalog grant can therefore be deleted or resynced concurrently without both
+concluding "the other one still needs it" and orphaning the grant.
+
+An operation holds **one grant lock at a time**. If code ever nests them, the
+keys must be taken in ascending order; out-of-order nesting raises an error,
+which rules out lock-order deadlocks.
 
 To release one ledger row:
 
@@ -220,9 +250,10 @@ GRANT MANAGE ON CATALOG <catalog> TO `<app-service-principal-application-id>`;
 * **Identity is the group id, not the name.** Before every preview, apply,
   resync, delete and membership operation, the app looks up the stored SCIM
   id:
-  * **Renamed** (same id, new name): UC grants follow the principal, so the
-    app updates the bundle's `group_name` and the ledger's `principal` to the
-    current name, then continues using that name.
+  * **Renamed** (same id, new name): UC grants follow the principal. Apply,
+    resync, delete and membership changes update the bundle's `group_name` and
+    the ledger's `principal` to the current name, then use that name. Preview
+    only reports the rename.
   * **No longer account-level**: the operation is blocked (400).
   * **Deleted**: the bundle is **blocked**, even if a new group with the same
     name exists. That is a different principal, and granting to or revoking
@@ -349,6 +380,28 @@ the same restriction dimension; use A for one-off tables.
 Either way, the restriction step runs **before apply**. The preview gains a
 "restriction" column, and the grant ledger remains the only record that
 drives revocation.
+
+## Running the tests
+
+```bash
+PGAPPNAME=test PYTHONPATH=src python -m pytest src/permissions_app/tests
+```
+
+The repo has no CI. The concurrency and migration tests that need **real
+Postgres** semantics (READ COMMITTED, advisory locks) are skipped unless
+`UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
+
+```bash
+initdb -D /tmp/ucg-pg -U postgres --auth=trust
+pg_ctl -D /tmp/ucg-pg -o "-p 55432 -k /tmp -c listen_addresses=''" -l /tmp/ucg-pg.log start
+psql -h /tmp -p 55432 -U postgres -c "create database ucg_test"
+UCG_TEST_PG_URL="postgresql+psycopg://postgres@/ucg_test?host=/tmp&port=55432" \
+  PGAPPNAME=test PYTHONPATH=src python -m pytest src/permissions_app/tests
+pg_ctl -D /tmp/ucg-pg stop
+```
+
+The Postgres tests drop and recreate the app's tables in that database, so
+point `UCG_TEST_PG_URL` only at a throwaway database.
 
 ## Assumptions and limitations
 

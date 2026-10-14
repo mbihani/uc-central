@@ -29,6 +29,7 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     create_engine,
+    event,
     text,
 )
 from sqlalchemy import inspect as sa_inspect
@@ -299,7 +300,7 @@ def _bundle(session, space_id=SPACE_ID, group=GROUP):
 
 
 def _apply(ws, session, bundle, *, resync=False):
-    plan = build_plan(ws, session, bundle)
+    plan = build_plan(ws, session, bundle, persist_rename=True)
     assert not plan.blockers, plan.blockers
     return apply_plan(ws, session, bundle, plan, "admin@example.com", revoke_stale=resync)
 
@@ -393,7 +394,7 @@ def test_preview_is_read_only_and_reports_present_grants(fixture_space, session)
     ws.uc_inherited[("catalog", CAT)] = [("account users", "USE_CATALOG", "metastore")]
     bundle = _bundle(session)
 
-    preview = to_preview(bundle, build_plan(ws, session, bundle))
+    preview = to_preview(bundle, build_plan(ws, session, bundle, persist_rename=False))
 
     assert ws.updates == [] and ws.space_sets == [] and _ledger(session) == []
     status = {(g.securable_type, g.full_name, g.privilege): g for g in preview.grants}
@@ -818,7 +819,10 @@ def test_concurrent_release_of_shared_grants_postgres(pg_engine, action, monkeyp
 # ─── 2. Grant-before-ledger: pending rows ────────────────────────────────────
 
 
-def test_crash_after_grant_leaves_pending_row_that_retry_confirms(session, monkeypatch):
+def test_crash_after_grant_is_reconciled_conservatively(session, monkeypatch):
+    """Grant succeeded, then the process died before confirming. The leftover
+    pending row is ambiguous, so it is confirmed as NEEDED but NOT app-granted:
+    the privilege is never auto-revoked, and the operator is told to review it."""
     ws = make_ws(_serialized([ORDERS]))
     bundle = _bundle(session)
     real_grant = gb._grant
@@ -835,7 +839,8 @@ def test_crash_after_grant_leaves_pending_row_that_retry_confirms(session, monke
 
     assert ws.has("table", ORDERS, "SELECT")  # the workspace grant happened
     row = next(r for r in _ledger(session, bundle.id) if r.full_name == ORDERS)
-    assert row.state == LEDGER_PENDING and row.app_granted  # ...and is tracked
+    assert row.state == LEDGER_PENDING  # ...and is tracked
+    assert row.app_granted is False  # but never claimed as app-made before CONFIRM
 
     monkeypatch.setattr(gb, "_grant", real_grant)
     adds_before = len([u for u in ws.updates if u[0] == "add"])
@@ -843,10 +848,42 @@ def test_crash_after_grant_leaves_pending_row_that_retry_confirms(session, monke
 
     assert retry.status == "ok", retry.errors
     assert [(g.full_name, g.status) for g in retry.reconciled] == [(ORDERS, "confirmed")]
+    assert "NOT app-granted" in (retry.reconciled[0].detail or "")
+    assert any("Review SELECT" in w and "will not revoke" in w for w in retry.warnings)
     assert len([u for u in ws.updates if u[0] == "add"]) == adds_before  # no re-grant
-    rows = _ledger(session, bundle.id)
-    assert all(r.state == LEDGER_CONFIRMED for r in rows)
-    # Tracked => revocable: delete removes the app-created grant.
+    row = next(r for r in _ledger(session, bundle.id) if r.full_name == ORDERS)
+    assert row.state == LEDGER_CONFIRMED and row.app_granted is False
+    # Conservative: delete releases the record but does NOT revoke the
+    # ambiguous grant; grants the app provably made (catalog/schema) are revoked.
+    res = delete_bundle(ws, session, bundle)
+    assert res.deleted
+    assert ws.has("table", ORDERS, "SELECT")
+    assert not ws.has("schema", f"{CAT}.sales", "USE_SCHEMA")
+    assert ("remove", "table", ORDERS, GROUP, "SELECT") not in ws.updates
+
+
+def test_previously_app_granted_row_keeps_ownership_through_a_crash(session, monkeypatch):
+    """A row that was already app-granted (then revoked externally) keeps its
+    flag while pending, so recovery does not lose provable ownership."""
+    ws = make_ws(_serialized([ORDERS]))
+    bundle = _bundle(session)
+    _apply(ws, session, bundle)
+    ws.uc[("table", ORDERS)][GROUP].discard("SELECT")  # someone revoked it
+    real_grant = gb._grant
+
+    def grant_then_crash(w, principal, key):
+        real_grant(w, principal, key)
+        raise RuntimeError("crash")
+
+    monkeypatch.setattr(gb, "_grant", grant_then_crash)
+    with pytest.raises(RuntimeError):
+        _apply(ws, session, bundle)
+    session.rollback()
+    monkeypatch.setattr(gb, "_grant", real_grant)
+    _apply(ws, session, bundle)
+
+    row = next(r for r in _ledger(session, bundle.id) if r.full_name == ORDERS)
+    assert row.state == LEDGER_CONFIRMED and row.app_granted is True
     delete_bundle(ws, session, bundle)
     assert not ws.has("table", ORDERS, "SELECT")
 
@@ -869,7 +906,7 @@ def test_crash_before_grant_pending_row_is_dropped_then_regranted(session, monke
     assert [r.state for r in _ledger(session, bundle.id) if r.full_name == ORDERS] == [LEDGER_PENDING]
 
     # A pending row counts as "still needed" for other bundles and is surfaced.
-    preview = to_preview(bundle, build_plan(ws, session, bundle))
+    preview = to_preview(bundle, build_plan(ws, session, bundle, persist_rename=False))
     assert any("PENDING" in w for w in preview.warnings)
 
     monkeypatch.setattr(gb, "_grant", real_grant)
@@ -964,7 +1001,7 @@ def test_deleted_group_recreated_with_same_name_is_blocked(session):
     ws.groups_by_id["g-9"] = (GROUP, "Group")  # same name, different principal
     n_updates, n_sets = len(ws.updates), len(ws.space_sets)
 
-    preview = to_preview(bundle, build_plan(ws, session, bundle))
+    preview = to_preview(bundle, build_plan(ws, session, bundle, persist_rename=False))
     assert not preview.can_apply
     assert any("no longer exists" in b for b in preview.blockers)
     with pytest.raises(HTTPException) as apply_exc:
@@ -1171,10 +1208,150 @@ def test_empty_discovery_blocks_apply(session, serialized):
     ws.serialized_space = serialized
     bundle = _bundle(session)
 
-    preview = to_preview(bundle, build_plan(ws, session, bundle))
+    preview = to_preview(bundle, build_plan(ws, session, bundle, persist_rename=False))
     assert not preview.can_apply
     assert any(b.startswith("Nothing to grant") for b in preview.blockers), preview.blockers
     with pytest.raises(HTTPException) as exc:
         _run(bundle.id or 0, ws, session, "admin@example.com", revoke_stale=False)
     assert exc.value.status_code == 400 and "Nothing to grant" in exc.value.detail
     assert ws.updates == [] and ws.space_sets == [] and _ledger(session) == []
+
+
+# ═══ Round 2: lock spans the grant, conservative recovery, write-free preview ═══
+
+
+def _record_writes(engine):
+    writes: list[str] = []
+
+    def on_exec(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().split(None, 1)[0].upper() in {"INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"}:
+            writes.append(statement)
+
+    event.listen(engine, "before_cursor_execute", on_exec)
+    return writes, lambda: event.remove(engine, "before_cursor_execute", on_exec)
+
+
+def test_preview_is_write_free_even_when_group_was_renamed(session):
+    ws = make_ws(_serialized([ORDERS]))
+    bundle = _bundle(session)
+    _apply(ws, session, bundle)
+    _rename(ws, "g-1", "genie-sales-renamed")
+    n_updates, n_sets = len(ws.updates), len(ws.space_sets)
+    engine = session.get_bind().engine
+    writes, stop = _record_writes(engine)
+    try:
+        preview = to_preview(bundle, build_plan(ws, session, bundle, persist_rename=False))
+        # The route returns here; nothing may be pending in the session either.
+        assert not session.new and not session.dirty and not session.deleted
+    finally:
+        stop()
+
+    assert writes == [], writes
+    assert len(ws.updates) == n_updates and len(ws.space_sets) == n_sets
+    assert preview.group.renamed_from == GROUP
+    assert preview.group.group_name == "genie-sales-renamed"
+    assert any("renamed" in w for w in preview.warnings)
+    # Ledger-owned grants are still recognised (looked up under the stored name).
+    statuses = {(g.securable_type, g.full_name): g.status for g in preview.grants}
+    assert statuses[("table", ORDERS)] == "managed"
+    with Session(engine) as fresh:
+        stored = fresh.get(GenieAccessBundle, bundle.id)
+        assert stored is not None and stored.group_name == GROUP  # not persisted
+        assert {r.principal for r in fresh.exec(select(GenieGrantLedger)).all()} == {GROUP}
+
+    # A mutating path persists it.
+    _apply(ws, session, bundle)
+    session.refresh(bundle)
+    assert bundle.group_name == "genie-sales-renamed"
+    assert {r.principal for r in _ledger(session, bundle.id)} == {"genie-sales-renamed"}
+
+
+def test_nested_grant_locks_must_be_taken_in_ascending_order(session):
+    k_a, k_b = sorted(
+        [GrantKey("table", f"{CAT}.s.a", "SELECT"), GrantKey("table", f"{CAT}.s.b", "SELECT")],
+        key=lambda k: gb.grant_lock_key(GROUP, k),
+    )
+    with gb._grant_lock(session, GROUP, k_a):
+        with gb._grant_lock(session, GROUP, k_b):
+            pass
+    with gb._grant_lock(session, GROUP, k_b):
+        with pytest.raises(RuntimeError, match="ascending"):
+            with gb._grant_lock(session, GROUP, k_a):
+                pass
+    assert session.info[gb._HELD_LOCKS] == []
+
+
+@requires_pg
+@pytest.mark.parametrize("contender", ["delete", "reconcile"])
+def test_contender_waits_while_grant_is_in_flight_postgres(pg_engine, contender, monkeypatch):
+    """Apply is paused right AFTER its pending row is committed and BEFORE the
+    workspace grant. A concurrent delete (or a second apply's reconcile) of the
+    same bundle must block on the per-grant lock instead of dropping the
+    pending row — otherwise the grant lands with no ledger record."""
+    ws = make_ws(_serialized([ORDERS]))
+    with Session(pg_engine) as s:
+        bundle_id = _bundle(s).id
+    paused, go = threading.Event(), threading.Event()
+    real_grant = gb._grant
+
+    def paused_grant(w, principal, key):
+        if key == ORDERS_SELECT:
+            paused.set()
+            assert go.wait(20)
+        real_grant(w, principal, key)
+
+    monkeypatch.setattr(gb, "_grant", paused_grant)
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+
+    def run(name, fn):
+        try:
+            with Session(pg_engine) as s:
+                bundle = s.get(GenieAccessBundle, bundle_id)
+                assert bundle is not None
+                results[name] = fn(s, bundle)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t_apply = threading.Thread(target=run, args=("apply", lambda s, b: _apply(ws, s, b)))
+    t_apply.start()
+    assert paused.wait(20)
+
+    with Session(pg_engine) as s:  # the pending row is durable and not app-granted
+        (pending,) = [r for r in s.exec(select(GenieGrantLedger)).all() if r.full_name == ORDERS]
+        assert pending.state == LEDGER_PENDING and pending.app_granted is False
+
+    contend = (
+        (lambda s, b: delete_bundle(ws, s, b))
+        if contender == "delete"
+        else (lambda s, b: _apply(ws, s, b))
+    )
+    t_other = threading.Thread(target=run, args=(contender, contend))
+    t_other.start()
+    t_other.join(1.0)
+    assert t_other.is_alive(), "contender did not wait for the in-flight grant"
+    with Session(pg_engine) as s:  # ...and has not touched the pending row
+        (still,) = [r for r in s.exec(select(GenieGrantLedger)).all() if r.full_name == ORDERS]
+        assert still.state == LEDGER_PENDING
+
+    go.set()
+    t_apply.join(30)
+    t_other.join(30)
+    assert errors == []
+
+    orders_adds = [u for u in ws.updates if u[:3] == ("add", "table", ORDERS)]
+    assert len(orders_adds) == 1
+    with Session(pg_engine) as s:
+        rows = s.exec(select(GenieGrantLedger)).all()
+        if contender == "delete":
+            # Delete saw the CONFIRMED, app-granted row and revoked it: no orphan.
+            assert results["delete"].deleted
+            assert rows == []
+            assert not ws.has("table", ORDERS, "SELECT")
+            assert ws.removes().count(("remove", "table", ORDERS, GROUP, "SELECT")) == 1
+        else:
+            # Reconcile found nothing pending; the in-flight apply proved the grant.
+            assert results["reconcile"].reconciled == []
+            (row,) = [r for r in rows if r.full_name == ORDERS]
+            assert row.state == LEDGER_CONFIRMED and row.app_granted is True
+            assert ws.has("table", ORDERS, "SELECT")
