@@ -27,6 +27,7 @@ from .models import (
     DEFAULT_PERSONA_DESCRIPTIONS,
     DEFAULT_PERSONA_LABELS,
     GENIE_BUNDLE_SPACE_UNIQUE,
+    GENIE_LEDGER_GROUP_ID_CHECK,
     LEDGER_CONFIRMED,
     DefaultPersona,
     GenieAccessBundle,
@@ -156,6 +157,11 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
         written after their grant succeeded, so they default to ``confirmed``.
       * ``genie_grant_ledger.group_id`` (the lock / sharing key) is ADDed if
         missing and backfilled from each row's bundle; its index is created.
+        If ANY row still has no group_id (its bundle is missing — there is no
+        FK to prevent that) the migration FAILS LOUDLY listing the row and
+        bundle ids, deleting nothing. On Postgres the transitional '' default is
+        then dropped and a non-empty CHECK added (fresh DBs get both from the
+        model).
       * the one-bundle-per-space UNIQUE index is created if missing. If the DB
         already holds several bundles for one space the migration FAILS LOUDLY
         (RuntimeError, aborting startup) naming them, rather than silently
@@ -171,6 +177,7 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
     )
     insp = inspect(conn)
     ledger = GenieGrantLedger.__tablename__
+    bundles = GenieAccessBundle.__tablename__
     if "state" not in {c["name"] for c in insp.get_columns(ledger)}:
         conn.execute(
             text(
@@ -195,11 +202,47 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
     ).rowcount
     if backfilled:
         logger.info(f"Backfilled group_id on {backfilled} {ledger} row(s)")
+    # Rows that could not be backfilled (their bundle is gone — there is no
+    # foreign key preventing that) would lose their identity: they would share
+    # one lock / "still needed" key with every other such row and could never
+    # be revoked safely. Refuse to start instead of guessing or deleting.
+    unkeyed = conn.execute(
+        text(
+            f"SELECT l.id, l.bundle_id, "
+            f"(SELECT COUNT(*) FROM {bundles} b WHERE b.id = l.bundle_id) "
+            f"FROM {ledger} l WHERE l.group_id IS NULL OR l.group_id = '' ORDER BY l.id"
+        )
+    ).all()
+    if unkeyed:
+        detail = ", ".join(
+            f"row {r[0]} (bundle {r[1]}{'' if r[2] else ' — MISSING'})" for r in unkeyed
+        )
+        raise RuntimeError(
+            f"{len(unkeyed)} {ledger} row(s) have no group_id and could not be "
+            f"backfilled from their bundle: {detail}. Nothing was changed or deleted. "
+            f"These rows record grants the app may have made for a bundle that no "
+            f"longer exists; review them (and revoke the grants by hand if "
+            f"appropriate), then set group_id or remove the rows, and restart."
+        )
+    if conn.dialect.name == "postgresql":
+        # Existing PG databases: the column was added with a transitional ''
+        # default; make it strictly required like a fresh database.
+        conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN group_id DROP DEFAULT"))
+        has_check = conn.execute(
+            text("SELECT 1 FROM pg_constraint WHERE conname = :n"),
+            {"n": GENIE_LEDGER_GROUP_ID_CHECK},
+        ).first()
+        if not has_check:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {ledger} ADD CONSTRAINT {GENIE_LEDGER_GROUP_ID_CHECK} "
+                    f"CHECK (group_id <> '')"
+                )
+            )
     conn.execute(
         text(f"CREATE INDEX IF NOT EXISTS ix_{ledger}_group_id ON {ledger} (group_id)")
     )
 
-    bundles = GenieAccessBundle.__tablename__
     if GENIE_BUNDLE_SPACE_UNIQUE not in {i["name"] for i in insp.get_indexes(bundles)}:
         dups = conn.execute(
             text(

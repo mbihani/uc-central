@@ -120,6 +120,19 @@ drops or rewrites data:
     were all written after their grant succeeded.
   * `genie_grant_ledger.group_id` is added, **backfilled from each row's
     bundle**, and indexed. It is the lock and sharing key.
+  * **Any ledger row still without a `group_id` blocks startup.** This happens
+    when the row's bundle no longer exists, because there is **no foreign
+    key** from ledger to bundle to prevent it. The migration fails loudly with
+    a `RuntimeError` listing each such row id and its missing bundle id, and
+    it **changes and deletes nothing**: the bootstrap transaction rolls back,
+    including the backfill and, on Postgres, the DDL. Such rows may record
+    grants the app made for a bundle that is gone. Review them, revoke by hand
+    if appropriate, then set `group_id` or remove the rows, and restart.
+    Without this guard they would all share one lock and "still needed" key
+    and could never be revoked safely.
+  * On Postgres, the transitional `''` default on `group_id` is then dropped
+    and the non-empty CHECK is added, so an upgraded database is as strict as
+    a fresh one.
   * The unique index `uq_genie_access_bundle_space_id` is created. **If that
     database already has several bundles for one space, startup fails loudly**
     with a `RuntimeError` naming each space and its bundle count. Nothing is
@@ -132,7 +145,9 @@ The two tables:
 * `genie_access_bundle` has one row per space (unique index on `space_id`).
   `group_id` is the group's identity; `group_name` is its current display name.
 * `genie_grant_ledger` has one row per privilege a bundle relies on. Its
-  columns are: `bundle_id`, `group_id` (immutable; the lock and sharing key),
+  columns are: `bundle_id`, `group_id` (immutable; the lock and sharing key;
+  **required**: `NOT NULL`, no default, and `CHECK (group_id <> '')`; the app
+  also refuses to write a row or take a lock without it),
   `space_id`, `principal` (the group's display name as last seen; informational
   only), `securable_type` (`genie_space` / `catalog` / `schema` / `table` /
   `volume`), `full_name`, `privilege`, `app_granted`, `state`
@@ -406,7 +421,7 @@ drives revocation.
 PGAPPNAME=test PYTHONPATH=src python -m pytest src/permissions_app/tests
 ```
 
-The repo has no CI. The 9 concurrency, pool and migration tests that need
+The repo has no CI. The 14 concurrency, pool and migration tests that need
 **real Postgres** semantics (READ COMMITTED, advisory locks, a real
 connection pool) are skipped unless `UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
 

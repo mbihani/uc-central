@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from .. import __version__
@@ -699,6 +699,7 @@ class PermissionConflictsOut(BaseModel):
 
 
 GENIE_BUNDLE_SPACE_UNIQUE = "uq_genie_access_bundle_space_id"
+GENIE_LEDGER_GROUP_ID_CHECK = "ck_genie_grant_ledger_group_id_nonempty"
 
 # Grant-ledger row states. A PENDING row is written durably BEFORE the workspace
 # grant call and flipped to CONFIRMED after it, so a crash in between can be
@@ -755,6 +756,11 @@ class GenieGrantLedger(SQLModel, table=True):
             "privilege",
             name="uq_genie_grant_ledger_bundle_grant",
         ),
+        # group_id is the identity / lock / sharing key: never empty. (NOT NULL
+        # comes from the required field below.) There is NO foreign key to
+        # genie_access_bundle, so seed.ensure_genie_bundle_schema also refuses
+        # to start if any row lacks it.
+        CheckConstraint("group_id <> ''", name=GENIE_LEDGER_GROUP_ID_CHECK),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -762,7 +768,7 @@ class GenieGrantLedger(SQLModel, table=True):
     # Immutable SCIM id of the bundle's group: the key for per-grant locks and
     # for "does another bundle still need this grant?". ``principal`` is the
     # group's display name as last seen (informational; UC calls re-resolve it).
-    group_id: str = Field(default="", index=True)
+    group_id: str = Field(index=True, nullable=False)  # REQUIRED: no default
     space_id: str = Field(index=True)
     principal: str = Field(index=True)
     # "genie_space" (ACL CAN_RUN) or a UC securable type: catalog/schema/table/volume.

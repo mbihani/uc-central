@@ -638,6 +638,7 @@ def test_ledger_migration_is_idempotent_on_fresh_db():
     with Session(engine) as s:
         row = dict(
             bundle_id=1,
+            group_id="g-1",
             space_id="s",
             principal=GROUP,
             securable_type="table",
@@ -935,6 +936,7 @@ def test_only_the_expected_unique_conflict_is_tolerated(session):
     bundle = _bundle(session)
     row = dict(
         bundle_id=bundle.id,
+        group_id="g-1",
         space_id=SPACE_ID,
         principal=GROUP,
         securable_type="table",
@@ -1567,3 +1569,146 @@ def test_concurrent_operations_do_not_exhaust_the_pool_postgres(pg_engine, monke
     with Session(small) as s:
         assert s.exec(select(GenieGrantLedger)).all() == []
     small.dispose()
+
+
+
+# ═══ Round 4: group_id is required; unkeyed ledger rows block startup ═══
+
+
+def _ledger_snapshot(conn):
+    cols = "id, bundle_id, space_id, principal, securable_type, full_name, privilege, app_granted"
+    return (
+        conn.execute(text(f"SELECT {cols} FROM genie_grant_ledger ORDER BY id")).all(),
+        conn.execute(text("SELECT id, space_id, group_id FROM genie_access_bundle ORDER BY id")).all(),
+    )
+
+
+@pytest.mark.parametrize("shape", ["v1", "round3"])
+@pytest.mark.parametrize("kind", _migration_engines())
+def test_migration_fails_loudly_on_ledger_row_whose_bundle_is_missing(kind, shape, tmp_path):
+    """A ledger row whose bundle is gone cannot be backfilled with a group id.
+    The migration must refuse to start — naming the row and the missing bundle
+    — and change / delete nothing."""
+    engine = _engine_for(kind, tmp_path)
+    _v1_schema(engine)
+    with engine.begin() as conn:
+        if shape == "round3":  # what the previous PR head created: '' default
+            conn.execute(text("ALTER TABLE genie_grant_ledger ADD COLUMN state VARCHAR NOT NULL DEFAULT 'confirmed'"))
+            conn.execute(text("ALTER TABLE genie_grant_ledger ADD COLUMN group_id VARCHAR NOT NULL DEFAULT ''"))
+        _v1_bundle(conn, 1, "space-a", GROUP)
+        for bid in (1, 99):  # 99: bundle deleted, row left behind
+            conn.execute(
+                text(
+                    "INSERT INTO genie_grant_ledger (bundle_id, space_id, principal, securable_type,"
+                    " full_name, privilege, app_granted, granted_at, granted_by) VALUES"
+                    " (:b, 'space-a', :g, 'table', 'c.s.t', 'SELECT', :t, CURRENT_TIMESTAMP, 'a')"
+                ),
+                {"b": bid, "g": GROUP, "t": True},
+            )
+    with engine.connect() as conn:
+        before = _ledger_snapshot(conn)
+    cols_before = {c["name"] for c in sa_inspect(engine).get_columns("genie_grant_ledger")}
+
+    with pytest.raises(RuntimeError) as exc:
+        with engine.begin() as conn:
+            ensure_genie_bundle_schema(conn)
+    msg = str(exc.value)
+    assert "row 2 (bundle 99 — MISSING)" in msg and "Nothing was changed or deleted" in msg
+    assert "row 1" not in msg  # the backfillable row is not listed
+
+    with engine.connect() as conn:
+        assert _ledger_snapshot(conn) == before  # nothing deleted or rewritten
+        if "group_id" in cols_before:
+            assert conn.execute(
+                text("SELECT group_id FROM genie_grant_ledger ORDER BY id")
+            ).scalars().all() == ["", ""]  # backfill rolled back too
+    if kind == "postgres":  # transactional DDL: the schema is untouched as well
+        assert {c["name"] for c in sa_inspect(engine).get_columns("genie_grant_ledger")} == cols_before
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("kind", _migration_engines())
+def test_fresh_and_already_migrated_dbs_stay_idempotent(kind, tmp_path):
+    engine = _engine_for(kind, tmp_path)
+    SQLModel.metadata.create_all(engine)  # fresh DB, current schema
+    with engine.begin() as conn:
+        ensure_genie_bundle_schema(conn)
+    with Session(engine) as s:
+        b = GenieAccessBundle(space_id="space-a", group_name=GROUP, group_id="g-1")
+        s.add(b)
+        s.commit()
+        s.add(
+            GenieGrantLedger(
+                bundle_id=b.id or 0, group_id="g-1", space_id="space-a", principal=GROUP,
+                securable_type="table", full_name="c.s.t", privilege="SELECT",
+            )
+        )
+        s.commit()
+    for _ in range(2):  # already migrated: re-running is a no-op
+        with engine.begin() as conn:
+            ensure_genie_bundle_schema(conn)
+    with Session(engine) as s:
+        (row,) = s.exec(select(GenieGrantLedger)).all()
+        assert row.group_id == "g-1"
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def _ledger_kwargs(**over):
+    base = dict(
+        bundle_id=1, space_id="s", principal=GROUP, securable_type="table",
+        full_name="c.s.t", privilege="SELECT",
+    )
+    base.update(over)
+    return base
+
+
+@pytest.mark.parametrize("kind", _migration_engines())
+def test_ledger_row_without_group_id_is_rejected(kind, tmp_path):
+    engine = _engine_for(kind, tmp_path)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(GenieGrantLedger(**_ledger_kwargs()))  # group_id omitted -> NULL
+        with pytest.raises(IntegrityError):
+            s.commit()
+        s.rollback()
+        s.add(GenieGrantLedger(**_ledger_kwargs(group_id="")))  # empty -> CHECK
+        with pytest.raises(IntegrityError):
+            s.commit()
+        s.rollback()
+        s.add(GenieGrantLedger(**_ledger_kwargs(group_id="g-1")))
+        s.commit()
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@requires_pg
+def test_upgraded_postgres_db_also_rejects_unkeyed_rows(tmp_path):
+    """A PG database upgraded from v1 ends up as strict as a fresh one: the
+    transitional '' default is dropped and the non-empty CHECK is added."""
+    engine = _engine_for("postgres", tmp_path)
+    _v1_schema(engine)
+    with engine.begin() as conn:
+        ensure_genie_bundle_schema(conn)
+    with Session(engine) as s:
+        s.add(GenieGrantLedger(**_ledger_kwargs()))
+        with pytest.raises(IntegrityError):
+            s.commit()
+        s.rollback()
+        s.add(GenieGrantLedger(**_ledger_kwargs(group_id="")))
+        with pytest.raises(IntegrityError) as exc:
+            s.commit()
+        s.rollback()
+        assert "ck_genie_grant_ledger_group_id_nonempty" in str(exc.value)
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def test_application_never_writes_or_locks_without_group_id(session):
+    bundle = GenieAccessBundle(id=5, space_id="s", group_name=GROUP, group_id="")
+    with pytest.raises(RuntimeError, match="no group id"):
+        gb._new_row(bundle, GROUP, ORDERS_SELECT, "admin", app_granted=False)
+    with pytest.raises(RuntimeError, match="without a group id"):
+        with gb._grant_lock(session, "", ORDERS_SELECT):
+            pass

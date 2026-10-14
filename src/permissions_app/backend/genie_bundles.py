@@ -602,6 +602,9 @@ def _grant_lock(session: Session, group_id: str, key: GrantKey) -> Iterator[None
     caller ever nests them (same session, same connection), keys must be taken
     in ascending order, which is enforced (RuntimeError otherwise).
     """
+    if not group_id:
+        # An empty id would collapse every unkeyed grant onto one lock.
+        raise RuntimeError("Refusing a grant lock without a group id.")
     k = grant_lock_key(group_id, key)
     held: list[int] = session.info.setdefault(_HELD_LOCKS, [])
     if held and k <= max(held):
@@ -1129,6 +1132,8 @@ def _after_pending_commit(key: GrantKey) -> None:
 def _new_row(
     bundle: GenieAccessBundle, principal: str, key: GrantKey, actor: str, *, app_granted: bool
 ) -> GenieGrantLedger:
+    if not bundle.group_id:
+        raise RuntimeError(f"Bundle {bundle.id} has no group id; refusing to write a ledger row.")
     return GenieGrantLedger(
         bundle_id=bundle.id or 0,
         group_id=bundle.group_id,
