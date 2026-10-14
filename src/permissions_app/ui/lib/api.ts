@@ -64,6 +64,81 @@ export interface DashboardStatsOut {
   unassigned_users: number;
 }
 
+export interface GenieBundleActionOut {
+  action: string;
+  adopted?: GenieGrantOut[];
+  bundle_id: number;
+  deleted?: boolean;
+  errors?: string[];
+  granted?: GenieGrantOut[];
+  released?: GenieGrantOut[];
+  revoked?: GenieGrantOut[];
+  status: string;
+  warnings?: string[];
+}
+
+export interface GenieBundleIn {
+  group_name: string;
+  space_id: string;
+}
+
+export interface GenieBundleOut {
+  created_at: string;
+  created_by: string;
+  group_id: string;
+  group_name: string;
+  id: number;
+  last_applied_at?: string | null;
+  last_applied_by?: string | null;
+  ledger_count?: number;
+  restriction_mode?: string;
+  space_id: string;
+  space_title: string;
+}
+
+export interface GenieBundlePreviewOut {
+  blockers?: string[];
+  bundle_id: number;
+  can_apply: boolean;
+  grants: GenieGrantOut[];
+  group: GenieGroupCheckOut;
+  objects: GenieSpaceObjectOut[];
+  space_id: string;
+  space_title: string;
+  stale_grants?: GenieGrantOut[];
+  warehouse_id?: string | null;
+  warnings?: string[];
+}
+
+export interface GenieGrantOut {
+  detail?: string | null;
+  full_name: string;
+  privilege: string;
+  securable_type: string;
+  status: string;
+}
+
+export interface GenieGroupCheckOut {
+  error?: string | null;
+  exists: boolean;
+  group_id?: string | null;
+  group_name: string;
+  is_account_group: boolean;
+  resource_type?: string | null;
+}
+
+export interface GenieSpaceObjectOut {
+  full_name?: string | null;
+  has_row_filter?: boolean;
+  identifier: string;
+  kind: string;
+  masked_columns?: string[];
+  reason?: string | null;
+  resolved: boolean;
+  row_filter_function?: string | null;
+  table_type?: string | null;
+}
+
 export interface GroupMemberOut {
   display_name?: string | null;
   user_id: string;
@@ -314,6 +389,50 @@ export interface GetDashboardStatsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface ListGenieBundlesParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface CreateGenieBundleParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface DeleteGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ApplyGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ListGenieBundleMembersParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface AddGenieBundleMemberParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface RemoveGenieBundleMemberParams {
+  bundle_id: number;
+  user_id: string;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface PreviewGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ResyncGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface ListGroupsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -499,6 +618,165 @@ export function useGetDashboardStats<TData = { data: DashboardStatsOut }>(option
 
 export function useGetDashboardStatsSuspense<TData = { data: DashboardStatsOut }>(options?: { params?: GetDashboardStatsParams; query?: Omit<UseSuspenseQueryOptions<{ data: DashboardStatsOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
   return useSuspenseQuery({ queryKey: getDashboardStatsKey(options?.params), queryFn: () => getDashboardStats(options?.params), ...options?.query });
+}
+
+export const listGenieBundles = async (params?: ListGenieBundlesParams, options?: RequestInit): Promise<{ data: GenieBundleOut[] }> => {
+  const res = await fetch("/api/genie-bundles", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const listGenieBundlesKey = (params?: ListGenieBundlesParams) => {
+  return ["/api/genie-bundles", params] as const;
+};
+
+export function useListGenieBundles<TData = { data: GenieBundleOut[] }>(options?: { params?: ListGenieBundlesParams; query?: Omit<UseQueryOptions<{ data: GenieBundleOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: listGenieBundlesKey(options?.params), queryFn: () => listGenieBundles(options?.params), ...options?.query });
+}
+
+export function useListGenieBundlesSuspense<TData = { data: GenieBundleOut[] }>(options?: { params?: ListGenieBundlesParams; query?: Omit<UseSuspenseQueryOptions<{ data: GenieBundleOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: listGenieBundlesKey(options?.params), queryFn: () => listGenieBundles(options?.params), ...options?.query });
+}
+
+export const createGenieBundle = async (data: GenieBundleIn, params?: CreateGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleOut }> => {
+  const res = await fetch("/api/genie-bundles", { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useCreateGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleOut }, ApiError, { params: CreateGenieBundleParams; data: GenieBundleIn }> }) {
+  return useMutation({ mutationFn: (vars) => createGenieBundle(vars.data, vars.params), ...options?.mutation });
+}
+
+export const deleteGenieBundle = async (params: DeleteGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useDeleteGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: DeleteGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => deleteGenieBundle(vars.params), ...options?.mutation });
+}
+
+export const applyGenieBundle = async (params: ApplyGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/apply`, { ...options, method: "POST", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useApplyGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: ApplyGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => applyGenieBundle(vars.params), ...options?.mutation });
+}
+
+export const listGenieBundleMembers = async (params: ListGenieBundleMembersParams, options?: RequestInit): Promise<{ data: GroupMemberOut[] }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const listGenieBundleMembersKey = (params?: ListGenieBundleMembersParams) => {
+  return ["/api/genie-bundles/{bundle_id}/members", params] as const;
+};
+
+export function useListGenieBundleMembers<TData = { data: GroupMemberOut[] }>(options: { params: ListGenieBundleMembersParams; query?: Omit<UseQueryOptions<{ data: GroupMemberOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: listGenieBundleMembersKey(options.params), queryFn: () => listGenieBundleMembers(options.params), ...options?.query });
+}
+
+export function useListGenieBundleMembersSuspense<TData = { data: GroupMemberOut[] }>(options: { params: ListGenieBundleMembersParams; query?: Omit<UseSuspenseQueryOptions<{ data: GroupMemberOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: listGenieBundleMembersKey(options.params), queryFn: () => listGenieBundleMembers(options.params), ...options?.query });
+}
+
+export const addGenieBundleMember = async (params: AddGenieBundleMemberParams, data: AddMemberIn, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useAddGenieBundleMember(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: AddGenieBundleMemberParams; data: AddMemberIn }> }) {
+  return useMutation({ mutationFn: (vars) => addGenieBundleMember(vars.params, vars.data), ...options?.mutation });
+}
+
+export const removeGenieBundleMember = async (params: RemoveGenieBundleMemberParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members/${encodeURIComponent(String(params.user_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useRemoveGenieBundleMember(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: RemoveGenieBundleMemberParams }> }) {
+  return useMutation({ mutationFn: (vars) => removeGenieBundleMember(vars.params), ...options?.mutation });
+}
+
+export const previewGenieBundle = async (params: PreviewGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundlePreviewOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const previewGenieBundleKey = (params?: PreviewGenieBundleParams) => {
+  return ["/api/genie-bundles/{bundle_id}/preview", params] as const;
+};
+
+export function usePreviewGenieBundle<TData = { data: GenieBundlePreviewOut }>(options: { params: PreviewGenieBundleParams; query?: Omit<UseQueryOptions<{ data: GenieBundlePreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: previewGenieBundleKey(options.params), queryFn: () => previewGenieBundle(options.params), ...options?.query });
+}
+
+export function usePreviewGenieBundleSuspense<TData = { data: GenieBundlePreviewOut }>(options: { params: PreviewGenieBundleParams; query?: Omit<UseSuspenseQueryOptions<{ data: GenieBundlePreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: previewGenieBundleKey(options.params), queryFn: () => previewGenieBundle(options.params), ...options?.query });
+}
+
+export const resyncGenieBundle = async (params: ResyncGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/resync`, { ...options, method: "POST", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useResyncGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: ResyncGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => resyncGenieBundle(vars.params), ...options?.mutation });
 }
 
 export const listGroups = async (params?: ListGroupsParams, options?: RequestInit): Promise<{ data: GroupOut[] }> => {

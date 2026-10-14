@@ -19,7 +19,7 @@ lazy per-request seed paths (``router._seed_*``) safe as well.
 
 from sqlalchemy import Connection, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlmodel import Session
+from sqlmodel import Session, SQLModel
 
 from .defaults import DEFAULT_PERMISSIONS_MATRIX
 from .logger import logger
@@ -27,6 +27,8 @@ from .models import (
     DEFAULT_PERSONA_DESCRIPTIONS,
     DEFAULT_PERSONA_LABELS,
     DefaultPersona,
+    GenieAccessBundle,
+    GenieGrantLedger,
     PermissionTemplate,
     PersonaDefinition,
 )
@@ -137,6 +139,24 @@ def ensure_unique_constraints(conn: Connection) -> None:
             )
         )
         logger.info(f"Added UNIQUE constraint {name} on {table}({', '.join(cols)})")
+
+
+def ensure_genie_bundle_schema(conn: Connection) -> None:
+    """Create the Genie access bundle + grant ledger tables IF missing.
+
+    Both tables are new (no pre-existing rows to de-duplicate), so
+    ``create_all(checkfirst=True)`` creates them together with their UNIQUE
+    constraints on a fresh or an existing database, and is a no-op on every
+    later run. Never alters or drops existing data.
+    """
+    SQLModel.metadata.create_all(
+        conn,
+        tables=[
+            SQLModel.metadata.tables[GenieAccessBundle.__tablename__],
+            SQLModel.metadata.tables[GenieGrantLedger.__tablename__],
+        ],
+        checkfirst=True,
+    )
 
 
 def seed_defaults(conn: Connection) -> None:

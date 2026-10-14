@@ -16,6 +16,7 @@ import { Route as SidebarProfileRouteImport } from './../routes/_sidebar/profile
 import { Route as SidebarPersonasRouteImport } from './../routes/_sidebar/personas'
 import { Route as SidebarPermissionsRouteImport } from './../routes/_sidebar/permissions'
 import { Route as SidebarGroupsRouteImport } from './../routes/_sidebar/groups'
+import { Route as SidebarGenieBundlesRouteImport } from './../routes/_sidebar/genie-bundles'
 import { Route as SidebarDashboardRouteImport } from './../routes/_sidebar/dashboard'
 
 const SidebarRouteRoute = SidebarRouteRouteImport.update({
@@ -52,6 +53,11 @@ const SidebarGroupsRoute = SidebarGroupsRouteImport.update({
   path: '/groups',
   getParentRoute: () => SidebarRouteRoute,
 } as any)
+const SidebarGenieBundlesRoute = SidebarGenieBundlesRouteImport.update({
+  id: '/genie-bundles',
+  path: '/genie-bundles',
+  getParentRoute: () => SidebarRouteRoute,
+} as any)
 const SidebarDashboardRoute = SidebarDashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
@@ -61,6 +67,7 @@ const SidebarDashboardRoute = SidebarDashboardRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/dashboard': typeof SidebarDashboardRoute
+  '/genie-bundles': typeof SidebarGenieBundlesRoute
   '/groups': typeof SidebarGroupsRoute
   '/permissions': typeof SidebarPermissionsRoute
   '/personas': typeof SidebarPersonasRoute
@@ -70,6 +77,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/dashboard': typeof SidebarDashboardRoute
+  '/genie-bundles': typeof SidebarGenieBundlesRoute
   '/groups': typeof SidebarGroupsRoute
   '/permissions': typeof SidebarPermissionsRoute
   '/personas': typeof SidebarPersonasRoute
@@ -81,6 +89,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/_sidebar': typeof SidebarRouteRouteWithChildren
   '/_sidebar/dashboard': typeof SidebarDashboardRoute
+  '/_sidebar/genie-bundles': typeof SidebarGenieBundlesRoute
   '/_sidebar/groups': typeof SidebarGroupsRoute
   '/_sidebar/permissions': typeof SidebarPermissionsRoute
   '/_sidebar/personas': typeof SidebarPersonasRoute
@@ -92,6 +101,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/dashboard'
+    | '/genie-bundles'
     | '/groups'
     | '/permissions'
     | '/personas'
@@ -101,6 +111,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/dashboard'
+    | '/genie-bundles'
     | '/groups'
     | '/permissions'
     | '/personas'
@@ -111,6 +122,7 @@ export interface FileRouteTypes {
     | '/'
     | '/_sidebar'
     | '/_sidebar/dashboard'
+    | '/_sidebar/genie-bundles'
     | '/_sidebar/groups'
     | '/_sidebar/permissions'
     | '/_sidebar/personas'
@@ -174,6 +186,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SidebarGroupsRouteImport
       parentRoute: typeof SidebarRouteRoute
     }
+    '/_sidebar/genie-bundles': {
+      id: '/_sidebar/genie-bundles'
+      path: '/genie-bundles'
+      fullPath: '/genie-bundles'
+      preLoaderRoute: typeof SidebarGenieBundlesRouteImport
+      parentRoute: typeof SidebarRouteRoute
+    }
     '/_sidebar/dashboard': {
       id: '/_sidebar/dashboard'
       path: '/dashboard'
@@ -186,6 +205,7 @@ declare module '@tanstack/react-router' {
 
 interface SidebarRouteRouteChildren {
   SidebarDashboardRoute: typeof SidebarDashboardRoute
+  SidebarGenieBundlesRoute: typeof SidebarGenieBundlesRoute
   SidebarGroupsRoute: typeof SidebarGroupsRoute
   SidebarPermissionsRoute: typeof SidebarPermissionsRoute
   SidebarPersonasRoute: typeof SidebarPersonasRoute
@@ -195,6 +215,7 @@ interface SidebarRouteRouteChildren {
 
 const SidebarRouteRouteChildren: SidebarRouteRouteChildren = {
   SidebarDashboardRoute: SidebarDashboardRoute,
+  SidebarGenieBundlesRoute: SidebarGenieBundlesRoute,
   SidebarGroupsRoute: SidebarGroupsRoute,
   SidebarPermissionsRoute: SidebarPermissionsRoute,
   SidebarPersonasRoute: SidebarPersonasRoute,

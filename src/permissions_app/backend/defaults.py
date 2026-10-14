@@ -10,6 +10,13 @@ from .models import Persona, PermissionLevel, ResourceType
 
 # The default permissions matrix: persona -> resource_type -> permission_level
 # Based on the blog's recommended mapping for a DEV environment.
+#
+# Genie spaces: consumer personas default to NO_PERMISSIONS. Genie runs every
+# query with the asking user's own UC privileges, so CAN_RUN on a space without
+# table access is useless; Genie access is granted per space through Genie
+# access bundles (docs/genie-access-bundles.md). Admin/Deployer keep CAN_MANAGE
+# (managing spaces, not consuming them). Only affects NEW seeds/cells — existing
+# saved template rows are never overwritten (seeding is ON CONFLICT DO NOTHING).
 DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] = {
     Persona.ADMIN: {
         ResourceType.CLUSTERS: PermissionLevel.CAN_MANAGE,
@@ -46,7 +53,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
-        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.NO_PERMISSIONS,  # via Genie access bundles
         ResourceType.APPS: PermissionLevel.CAN_USE,
         ResourceType.DATABASE_INSTANCES: PermissionLevel.CAN_USE,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
@@ -66,7 +73,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
-        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.NO_PERMISSIONS,  # via Genie access bundles
         ResourceType.APPS: PermissionLevel.CAN_USE,
         ResourceType.DATABASE_INSTANCES: PermissionLevel.NO_PERMISSIONS,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
@@ -86,7 +93,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_RUN,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_RUN,
         ResourceType.ALERTS: PermissionLevel.CAN_RUN,
-        ResourceType.GENIE_SPACES: PermissionLevel.CAN_RUN,
+        ResourceType.GENIE_SPACES: PermissionLevel.NO_PERMISSIONS,  # via Genie access bundles
         ResourceType.APPS: PermissionLevel.CAN_USE,
         ResourceType.DATABASE_INSTANCES: PermissionLevel.NO_PERMISSIONS,
         ResourceType.TOKENS: PermissionLevel.CAN_USE,
@@ -126,7 +133,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.DIRECTORIES: PermissionLevel.CAN_VIEW,
         ResourceType.DASHBOARDS: PermissionLevel.CAN_VIEW,
         ResourceType.ALERTS: PermissionLevel.CAN_VIEW,
-        ResourceType.GENIE_SPACES: PermissionLevel.CAN_READ,
+        ResourceType.GENIE_SPACES: PermissionLevel.NO_PERMISSIONS,  # via Genie access bundles
         ResourceType.APPS: PermissionLevel.CAN_USE,
         ResourceType.DATABASE_INSTANCES: PermissionLevel.NO_PERMISSIONS,
         ResourceType.TOKENS: PermissionLevel.NO_PERMISSIONS,
