@@ -226,6 +226,20 @@ RESOURCE_PERMISSION_LEVELS: dict[ResourceType, list[PermissionLevel]] = {
 }
 
 
+def normalize_permission_level(resource_type: str, permission_level: str) -> str:
+    """Return the canonical ACL level for a resource type.
+
+    Existing databases may still contain the legacy dashboard ``CAN_VIEW``
+    value, while Lakeview calls that permission ``CAN_READ``.
+    """
+    if (
+        resource_type == ResourceType.DASHBOARDS.value
+        and permission_level == PermissionLevel.CAN_VIEW.value
+    ):
+        return PermissionLevel.CAN_READ.value
+    return permission_level
+
+
 def is_permission_level_allowed(resource_type: str, permission_level: str) -> bool:
     """Whether ``permission_level`` is valid for ``resource_type``.
 
@@ -240,13 +254,9 @@ def is_permission_level_allowed(resource_type: str, permission_level: str) -> bo
       the existing "unsupported resource type" error path, so this predicate
       never masks that clearer, pre-existing error.
     """
+    permission_level = normalize_permission_level(resource_type, permission_level)
     if permission_level == PermissionLevel.NO_PERMISSIONS.value:
         return True
-    if (
-        resource_type == ResourceType.DASHBOARDS.value
-        and permission_level == PermissionLevel.CAN_VIEW.value
-    ):
-        permission_level = PermissionLevel.CAN_READ.value
     try:
         rt = ResourceType(resource_type)
     except ValueError:
@@ -634,7 +644,9 @@ def get_permission_rank(resource_type: str, permission_level: str) -> int:
     """
     try:
         rt = ResourceType(resource_type)
-        pl = PermissionLevel(permission_level)
+        pl = PermissionLevel(
+            normalize_permission_level(resource_type, permission_level)
+        )
         levels = RESOURCE_PERMISSION_LEVELS.get(rt, [])
         if pl in levels:
             return levels.index(pl)
@@ -647,9 +659,12 @@ def get_higher_permission(resource_type: str, *levels: str) -> str:
     """Return the highest permission level from the given levels for a resource type."""
     if not levels:
         return PermissionLevel.NO_PERMISSIONS.value
-    best = levels[0]
+    normalized_levels = [
+        normalize_permission_level(resource_type, level) for level in levels
+    ]
+    best = normalized_levels[0]
     best_rank = get_permission_rank(resource_type, best)
-    for lvl in levels[1:]:
+    for lvl in normalized_levels[1:]:
         rank = get_permission_rank(resource_type, lvl)
         if rank > best_rank:
             best = lvl

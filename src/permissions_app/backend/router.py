@@ -62,6 +62,7 @@ from .models import (
     get_higher_permission,
     get_permission_rank,
     is_permission_level_allowed,
+    normalize_permission_level,
 )
 from .resources import SUPPORTED_ACL_RESOURCE_TYPES, apply_group_acl, apply_user_acl, list_resources
 from .seed import seed_permission_templates, seed_persona_definitions
@@ -801,8 +802,9 @@ def _effective_user_level(
             )
         ).first()
         if tmpl:
-            best = get_higher_permission(resource_type, best, tmpl.permission_level)
-    return best
+            level = normalize_permission_level(resource_type, tmpl.permission_level)
+            best = get_higher_permission(resource_type, best, level)
+    return normalize_permission_level(resource_type, best)
 
 
 def _sync_direct_user_acl(
@@ -1114,6 +1116,9 @@ def update_permission_matrix(body: PermissionMatrixCell, session: SessionDep, _a
     # support (e.g. CAN_MANAGE on a cluster-policy). Reject with a 400 before the
     # DB write; NO_PERMISSIONS is always allowed.
     _assert_level_allowed(body.resource_type.value, body.permission_level.value)
+    normalized_level = normalize_permission_level(
+        body.resource_type.value, body.permission_level.value
+    )
 
     template = session.exec(
         select(PermissionTemplate).where(
@@ -1127,11 +1132,11 @@ def update_permission_matrix(body: PermissionMatrixCell, session: SessionDep, _a
         template = PermissionTemplate(
             persona=body.persona,
             resource_type=body.resource_type.value,
-            permission_level=body.permission_level.value,
+            permission_level=normalized_level,
         )
         session.add(template)
     else:
-        template.permission_level = body.permission_level.value
+        template.permission_level = normalized_level
 
     session.commit()
     session.refresh(template)
@@ -1235,9 +1240,12 @@ def check_permission_conflicts(
             persona_levels: dict[str, str] = {}
             levels_set: set[str] = set()
             for persona_val in user_personas:
-                level = template_map.get(
-                    f"{persona_val}::{rt.value}",
-                    PermissionLevel.NO_PERMISSIONS.value,
+                level = normalize_permission_level(
+                    rt.value,
+                    template_map.get(
+                        f"{persona_val}::{rt.value}",
+                        PermissionLevel.NO_PERMISSIONS.value,
+                    ),
                 )
                 persona_label = persona_label_map.get(persona_val, persona_val)
                 persona_levels[persona_label] = level
@@ -1312,7 +1320,9 @@ def _compute_apply_plan(
     skipped: list[ApplyPlanSkippedOut] = []
 
     for template in templates:
-        level = template.permission_level
+        level = normalize_permission_level(
+            template.resource_type, template.permission_level
+        )
         rt = template.resource_type
         label = _resource_type_label(rt)
 
@@ -1517,7 +1527,9 @@ def apply_permissions(
     for template in templates:
         # Apply THIS persona's own matrix level for the resource type — never a
         # cross-persona max. (Multi-group users are unioned by Databricks itself.)
-        level = template.permission_level
+        level = normalize_permission_level(
+            template.resource_type, template.permission_level
+        )
 
         # Resource types advertised in the matrix but that the app cannot
         # actually enumerate (no lister) must NOT report a false "success".
