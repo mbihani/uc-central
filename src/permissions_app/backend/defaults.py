@@ -124,7 +124,7 @@ DEFAULT_PERMISSIONS_MATRIX: dict[Persona, dict[ResourceType, PermissionLevel]] =
         ResourceType.WAREHOUSES: PermissionLevel.NO_PERMISSIONS,
         ResourceType.NOTEBOOKS: PermissionLevel.CAN_VIEW,
         ResourceType.DIRECTORIES: PermissionLevel.CAN_VIEW,
-        ResourceType.DASHBOARDS: PermissionLevel.CAN_VIEW,
+        ResourceType.DASHBOARDS: PermissionLevel.CAN_READ,
         ResourceType.ALERTS: PermissionLevel.CAN_VIEW,
         ResourceType.GENIE_SPACES: PermissionLevel.CAN_READ,
         ResourceType.APPS: PermissionLevel.CAN_USE,

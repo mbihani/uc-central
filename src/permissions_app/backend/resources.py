@@ -7,7 +7,12 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import iam
 
 from .logger import logger
-from .models import PermissionLevel, ResourceItemOut, ResourceType
+from .models import (
+    PermissionLevel,
+    ResourceItemOut,
+    ResourceType,
+    normalize_permission_level,
+)
 
 # Resource types whose individual resources this app can actually enumerate
 # (i.e. `list_resources` has a real lister). Types advertised in the matrix but
@@ -109,6 +114,7 @@ def apply_group_acl(
 
     # Apply the managed groups. NO_PERMISSIONS => omit => revoke.
     for group_name, level in group_levels.items():
+        level = normalize_permission_level(resource_type, level)
         if level == PermissionLevel.NO_PERMISSIONS.value:
             continue
         merged.append(
@@ -177,6 +183,7 @@ def apply_user_acl(
             )
 
     for user_name, level in user_levels.items():
+        level = normalize_permission_level(resource_type, level)
         if level == PermissionLevel.NO_PERMISSIONS.value:
             continue
         merged.append(
@@ -392,17 +399,19 @@ def _list_warehouses(ws: WorkspaceClient) -> list[ResourceItemOut]:
 
 def _list_dashboards(ws: WorkspaceClient) -> list[ResourceItemOut]:
     items = []
-    try:
-        for d in ws.dashboards.list():
-            items.append(
-                ResourceItemOut(
-                    id=str(d.id),
-                    name=d.name or f"Dashboard {d.id}",
-                    resource_type=ResourceType.DASHBOARDS,
-                )
+    # The SDK iterator follows Lakeview next-page tokens automatically. Filtering
+    # TRASHED is defensive because the API excludes them unless show_trashed=True.
+    for d in ws.lakeview.list():
+        lifecycle_state = getattr(d.lifecycle_state, "value", d.lifecycle_state)
+        if lifecycle_state == "TRASHED":
+            continue
+        items.append(
+            ResourceItemOut(
+                id=str(d.dashboard_id),
+                name=d.display_name or f"Dashboard {d.dashboard_id}",
+                resource_type=ResourceType.DASHBOARDS,
             )
-    except Exception as e:
-        logger.warning(f"Could not list dashboards: {e}")
+        )
     return items
 
 
@@ -410,7 +419,7 @@ def _list_genie_spaces(ws: WorkspaceClient) -> list[ResourceItemOut]:
     # `genie.list_spaces` is NOT an auto-paginating iterator (unlike the other
     # `.list()` calls above): it returns one page + a `next_page_token`, so we
     # loop until the token is empty to enumerate every space. The permissions API
-    # keys on the space's `space_id`. Guarded like dashboards/models so a
+    # keys on the space's `space_id`. Guarded like models so a
     # workspace without Genie enabled degrades to an empty list instead of a 500.
     items = []
     try:
@@ -437,7 +446,7 @@ def _list_apps(ws: WorkspaceClient) -> list[ResourceItemOut]:
     # The apps permissions API keys on the app NAME, not its opaque id/uuid —
     # permissions.get(request_object_type="apps", request_object_id=<uuid>) is
     # rejected with "App ... does not exist" (verified live), so both id and name
-    # here are the app name. Guarded like dashboards so a workspace with no apps
+    # here are the app name. Guarded so a workspace with no apps
     # (or no list permission) degrades to an empty list instead of a 500.
     items = []
     try:

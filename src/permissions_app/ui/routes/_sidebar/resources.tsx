@@ -97,7 +97,7 @@ const ALLOWED_PERMISSION_LEVELS: Record<string, string[]> = {
   warehouses: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE, PermissionLevel.CAN_MANAGE, PermissionLevel.IS_OWNER],
   notebooks: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   directories: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
-  dashboards: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
+  dashboards: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   alerts: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_VIEW, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   genie: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_READ, PermissionLevel.CAN_RUN, PermissionLevel.CAN_EDIT, PermissionLevel.CAN_MANAGE],
   apps: [PermissionLevel.NO_PERMISSIONS, PermissionLevel.CAN_USE, PermissionLevel.CAN_MANAGE],

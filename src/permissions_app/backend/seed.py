@@ -107,6 +107,7 @@ def ensure_unique_constraints(conn: Connection) -> None:
     Table/column/constraint names are internal constants (never user input), so
     interpolating them into the DDL is safe.
     """
+    migrate_dashboard_permission_levels(conn)
     for table, cols, name in _UNIQUE_CONSTRAINTS:
         exists = conn.execute(
             text("SELECT 1 FROM pg_constraint WHERE conname = :name"),
@@ -137,6 +138,21 @@ def ensure_unique_constraints(conn: Connection) -> None:
             )
         )
         logger.info(f"Added UNIQUE constraint {name} on {table}({', '.join(cols)})")
+
+
+def migrate_dashboard_permission_levels(conn: Connection) -> None:
+    """Canonicalize legacy Lakeview permission rows; safe on every startup."""
+    updated = conn.execute(
+        text(
+            "UPDATE permission_template SET permission_level = 'CAN_READ' "
+            "WHERE resource_type = 'dashboards' AND permission_level = 'CAN_VIEW'"
+        )
+    ).rowcount
+    if updated:
+        logger.info(
+            f"Migrated {updated} dashboard permission template row(s) "
+            "from CAN_VIEW to CAN_READ"
+        )
 
 
 def seed_defaults(conn: Connection) -> None:
