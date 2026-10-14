@@ -192,6 +192,11 @@ class FakeWorkspace:
     def _update(self, securable_type, full_name, changes=None):
         if (securable_type, full_name) in self.deny_update:
             raise PermissionDenied(f"User does not have MANAGE on {securable_type} '{full_name}'.")
+        names = {n for n, _ in self.groups_by_id.values()}
+        for ch in changes or []:
+            if ch.principal not in names:
+                # UC resolves principals by name at call time: a stale name fails.
+                raise NotFound(f"Could not find principal with name {ch.principal}.")
         for ch in changes or []:
             held = self.uc.setdefault((securable_type, full_name), {}).setdefault(ch.principal, set())
             for p in ch.add or []:
@@ -1151,6 +1156,9 @@ def test_migration_upgrades_v1_db_idempotently(kind, tmp_path):
     with Session(engine) as s:
         (row,) = s.exec(select(GenieGrantLedger)).all()
         assert row.state == LEDGER_CONFIRMED and row.app_granted  # data preserved
+        assert row.group_id == "g"  # backfilled from the owning bundle
+    assert "ix_genie_grant_ledger_group_id" in {i["name"] for i in insp.get_indexes("genie_grant_ledger")}
+    with Session(engine) as s:
         s.add(GenieAccessBundle(space_id="space-a", group_name="x", group_id="g-x"))
         with pytest.raises(IntegrityError):
             s.commit()
@@ -1355,3 +1363,207 @@ def test_contender_waits_while_grant_is_in_flight_postgres(pg_engine, contender,
             (row,) = [r for r in rows if r.full_name == ORDERS]
             assert row.state == LEDGER_CONFIRMED and row.app_granted is True
             assert ws.has("table", ORDERS, "SELECT")
+
+
+# ═══ Round 3: lock / sharing keyed on the immutable group id; one connection ═══
+
+NEW_NAME = "genie-sales-renamed"
+
+
+def test_sharing_is_by_group_id_not_by_stored_name(session):
+    """A's ledger row still carries the OLD name (never touched since the
+    rename); B's carries the new one. B's release must still see A's row as
+    'still needed' — sharing is by group id — and must not revoke."""
+    ws = make_ws(_serialized([ORDERS]))
+    a, b = _shared_setup(ws, session)
+    _rename(ws, "g-1", NEW_NAME)
+    # Make B the owner of the app-made grants and A a mere adopter, and leave
+    # A's rows under the OLD name (partial propagation).
+    for r in _ledger(session, a.id):
+        r.app_granted = False
+        session.add(r)
+    for r in _ledger(session, b.id):
+        r.app_granted = True
+        r.principal = NEW_NAME
+        session.add(r)
+    session.commit()
+
+    res = _release_only(ws, session, b)
+
+    assert ws.removes() == []  # A (same group id, old name) still needs them
+    assert ws.has("table", ORDERS, "SELECT", principal=NEW_NAME)
+    assert any(g.full_name == ORDERS and g.status == "released" for g in res.released)
+    a_orders = next(r for r in _ledger(session, a.id) if r.full_name == ORDERS)
+    assert a_orders.app_granted is True  # ownership handed over by group id
+
+
+def _release_only(ws, session, bundle):
+    result = gb.GenieBundleActionOut(bundle_id=bundle.id or 0, action="delete", status="ok")
+    gb._release_rows(ws, session, _ledger(session, bundle.id), result)
+    return result
+
+
+def test_lock_key_ignores_display_name():
+    # The key is derived from the group id only; names never enter it.
+    assert gb.grant_lock_key("g-1", ORDERS_SELECT) != gb.grant_lock_key("g-2", ORDERS_SELECT)
+    assert gb.grant_lock_key("g-1", ORDERS_SELECT) == gb.grant_lock_key("g-1", GrantKey("table", ORDERS, "SELECT"))
+
+
+def test_revoke_uses_current_name_resolved_by_id(session):
+    ws = make_ws(_serialized([ORDERS]))
+    bundle = _bundle(session)
+    _apply(ws, session, bundle)
+    _rename(ws, "g-1", NEW_NAME)
+    # Another group now carries the OLD name: it must never be touched.
+    ws.groups_by_id["g-7"] = (GROUP, "Group")
+    ws.uc[("table", ORDERS)][GROUP] = {"SELECT"}
+
+    # Release WITHOUT rename propagation, so the stored ledger name is stale.
+    res = _release_only(ws, session, bundle)
+
+    assert res.errors == []
+    assert ("remove", "table", ORDERS, NEW_NAME, "SELECT") in ws.removes()
+    assert not any(u[3] == GROUP for u in ws.removes())
+    assert ws.has("table", ORDERS, "SELECT", principal=GROUP)  # the other group's
+
+
+@requires_pg
+@pytest.mark.parametrize("contender", ["delete", "apply"])
+def test_rename_during_inflight_grant_contender_waits_postgres(pg_engine, contender, monkeypatch):
+    """Apply (resolved under the OLD name) is paused right after its pending
+    commit; the group is then renamed and a contender runs under the NEW name.
+    Because locks are keyed on the group id, the contender (whose rename
+    propagation and release need the same per-grant lock) waits; afterwards
+    there is no orphan and every app-made grant is revoked exactly once."""
+    ws = make_ws(_serialized([ORDERS]))
+    with Session(pg_engine) as s:
+        bundle_id = _bundle(s).id
+    paused, go = threading.Event(), threading.Event()
+
+    def pause(key):
+        if key == ORDERS_SELECT:
+            paused.set()
+            assert go.wait(20)
+
+    monkeypatch.setattr(gb, "_after_pending_commit", pause)
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+
+    def run(name, fn):
+        try:
+            with Session(pg_engine) as s:
+                bundle = s.get(GenieAccessBundle, bundle_id)
+                assert bundle is not None
+                results[name] = fn(s, bundle)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t_apply = threading.Thread(target=run, args=("apply_a", lambda s, b: _apply(ws, s, b)))
+    t_apply.start()
+    assert paused.wait(20)
+    _rename(ws, "g-1", NEW_NAME)
+
+    # Rename propagation alone must also wait for the in-flight grant's lock.
+    renamer_done = threading.Event()
+
+    def propagate():
+        with Session(pg_engine) as s:
+            b = s.get(GenieAccessBundle, bundle_id)
+            assert b is not None
+            gb.resolve_bundle_group(ws, s, b, persist_rename=True)
+        renamer_done.set()
+
+    t_ren = threading.Thread(target=propagate, daemon=True)
+    t_ren.start()
+    assert not renamer_done.wait(1.0), "rename propagation did not wait for the grant lock"
+    with Session(pg_engine) as s:
+        (row,) = [r for r in s.exec(select(GenieGrantLedger)).all() if r.full_name == ORDERS]
+        assert row.principal == GROUP  # untouched while the grant is in flight
+
+    contend = (
+        (lambda s, b: delete_bundle(ws, s, b))
+        if contender == "delete"
+        else (lambda s, b: _apply(ws, s, b))
+    )
+    t_other = threading.Thread(target=run, args=(contender, contend))
+    t_other.start()
+    t_other.join(1.0)
+    assert t_other.is_alive(), "contender (new name) did not wait for the in-flight grant"
+    with Session(pg_engine) as s:
+        (row,) = [r for r in s.exec(select(GenieGrantLedger)).all() if r.full_name == ORDERS]
+        assert row.state == LEDGER_PENDING and row.app_granted is False
+
+    go.set()
+    t_apply.join(30)
+    t_other.join(30)
+    t_ren.join(30)
+    assert errors == [] and renamer_done.is_set()
+
+    orders_adds = [u for u in ws.updates if u[:3] == ("add", "table", ORDERS)]
+    assert orders_adds == [("add", "table", ORDERS, NEW_NAME, "SELECT")]  # current name
+    with Session(pg_engine) as s:
+        rows = s.exec(select(GenieGrantLedger)).all()
+        if contender == "delete":
+            assert results["delete"].deleted and rows == []
+            for typ, name, priv in [
+                ("table", ORDERS, "SELECT"),
+                ("schema", f"{CAT}.sales", "USE_SCHEMA"),
+                ("catalog", CAT, "USE_CATALOG"),
+            ]:
+                assert ws.removes().count(("remove", typ, name, NEW_NAME, priv)) == 1
+                assert not ws.has(typ, name, priv, principal=NEW_NAME)
+            assert not any(holders.get(GROUP) for holders in ws.uc.values())  # no orphan
+        else:
+            assert {r.principal for r in rows} == {NEW_NAME}
+            (orders,) = [r for r in rows if r.full_name == ORDERS]
+            assert orders.state == LEDGER_CONFIRMED and orders.app_granted is True
+            assert ws.has("table", ORDERS, "SELECT", principal=NEW_NAME)
+
+
+@requires_pg
+def test_concurrent_operations_do_not_exhaust_the_pool_postgres(pg_engine, monkeypatch):
+    """pool_size=2, no overflow, N=4 concurrent applies then deletes, all
+    contending on the same shared grants. Each operation must use ONE pooled
+    connection (the ORM session is bound to the advisory-lock connection), so
+    they all finish instead of timing out waiting for a second connection."""
+    small = create_engine(PG_URL or "", pool_size=2, max_overflow=0, pool_timeout=5)
+    ws = make_ws(_serialized([ORDERS]))
+    n = 4
+    with Session(small) as s:
+        ids = []
+        for i in range(n):
+            space = SPACE_ID if i == 0 else f"space-{i}"
+            ws.space_acl.setdefault(space, {})
+            ids.append(_bundle(s, space_id=space).id)
+    monkeypatch.setattr(gb, "_after_pending_commit", lambda key: time.sleep(0.1))
+
+    def run_all(fn):
+        barrier = threading.Barrier(n)
+        errors: list[str] = []
+
+        def worker(bid):
+            try:
+                with Session(small) as s:
+                    bundle = s.get(GenieAccessBundle, bid)
+                    assert bundle is not None
+                    s.commit()
+                    barrier.wait()
+                    res = fn(s, bundle)
+                    assert res.errors == [], res.errors
+            except Exception as e:
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        return errors
+
+    assert run_all(lambda s, b: _apply(ws, s, b)) == []
+    assert len([u for u in ws.updates if u[:3] == ("add", "table", ORDERS)]) == 1
+    assert run_all(lambda s, b: delete_bundle(ws, s, b)) == []
+    assert ws.removes().count(("remove", "table", ORDERS, GROUP, "SELECT")) == 1
+    with Session(small) as s:
+        assert s.exec(select(GenieGrantLedger)).all() == []
+    small.dispose()

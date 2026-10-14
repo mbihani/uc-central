@@ -114,10 +114,12 @@ drops or rewrites data:
 
 * `create_all(checkfirst)` creates any missing table. On a fresh database,
   every column and index is created in place.
-* On a database created by the first version of this feature, two upgrades
-  run:
+* On a database created by an earlier version of this feature, these
+  upgrades run:
   * `genie_grant_ledger.state` is added with default `confirmed`. Those rows
     were all written after their grant succeeded.
+  * `genie_grant_ledger.group_id` is added, **backfilled from each row's
+    bundle**, and indexed. It is the lock and sharing key.
   * The unique index `uq_genie_access_bundle_space_id` is created. **If that
     database already has several bundles for one space, startup fails loudly**
     with a `RuntimeError` naming each space and its bundle count. Nothing is
@@ -130,8 +132,9 @@ The two tables:
 * `genie_access_bundle` has one row per space (unique index on `space_id`).
   `group_id` is the group's identity; `group_name` is its current display name.
 * `genie_grant_ledger` has one row per privilege a bundle relies on. Its
-  columns are: `bundle_id`, `space_id`, `principal` (the group's current
-  name), `securable_type` (`genie_space` / `catalog` / `schema` / `table` /
+  columns are: `bundle_id`, `group_id` (immutable; the lock and sharing key),
+  `space_id`, `principal` (the group's display name as last seen; informational
+  only), `securable_type` (`genie_space` / `catalog` / `schema` / `table` /
   `volume`), `full_name`, `privilege`, `app_granted`, `state`
   (`pending` / `confirmed`), `granted_at`, `granted_by`. A UNIQUE constraint
   covers (bundle, principal, securable, privilege). Only *that* uniqueness
@@ -182,17 +185,30 @@ The preview warns whenever pending rows exist.
 ### Safe revoke (resync / delete)
 
 Every decision about one grant runs under a **per-grant lock** keyed on a
-stable 64-bit hash of (principal, securable type, full name, privilege).
-On Postgres this is a **session-level `pg_advisory_lock`** taken on a
-dedicated pooled connection. It stays held across the commits and workspace
-calls inside the span, and is released with `pg_advisory_unlock` in a
-`finally`. If the unlock itself fails, the lock connection is invalidated, so
-its backend closes and the lock is freed rather than returned to the pool
-still held. On other databases (the SQLite used in tests), a process-local
-lock is used.
+stable 64-bit hash of (**group id**, securable type, full name, privilege).
+The key uses the group's **immutable SCIM id**, never its mutable display
+name, so a rename can't let a second operation take a "different" lock for
+the same grant.
 
-Within the lock, the app re-reads the other bundles' rows, drops its own row,
-and revokes if it was the last user. Two bundles sharing a table, schema or
+On Postgres the lock is a **session-level `pg_advisory_lock`** taken on a
+dedicated pooled connection. **While it is held, the ORM session is bound to
+that same connection**, so each operation uses exactly one pooled connection
+and concurrent operations can't exhaust the pool waiting for a second one.
+The lock stays held across the commits and workspace calls inside the span,
+and is released with `pg_advisory_unlock` in a `finally`. If the unlock
+itself fails, the connection is invalidated, so its backend closes and the
+lock is freed rather than returned to the pool still held. On other databases
+(the SQLite used in tests), a process-local lock is used.
+
+Inside each lock span, the group's **current display name is re-resolved by
+id**, right before every UC or ACL call. Grants and revokes therefore always
+target the group the bundle was created for, never another group that now
+carries an old name. If the id is gone or is no longer an account group, the
+call is skipped and an error is reported.
+
+Within the lock, the app re-reads the other bundles' rows **with the same
+group id** (not the same stored name), drops its own row, and revokes if it
+was the last user. Two bundles sharing a table, schema or
 catalog grant can therefore be deleted or resynced concurrently without both
 concluding "the other one still needs it" and orphaning the grant.
 
@@ -251,9 +267,12 @@ GRANT MANAGE ON CATALOG <catalog> TO `<app-service-principal-application-id>`;
   resync, delete and membership operation, the app looks up the stored SCIM
   id:
   * **Renamed** (same id, new name): UC grants follow the principal. Apply,
-    resync, delete and membership changes update the bundle's `group_name` and
-    the ledger's `principal` to the current name, then use that name. Preview
-    only reports the rename.
+    resync, delete and membership changes update the bundle's `group_name`,
+    and update each ledger row's `principal` while holding **that row's
+    per-grant lock**, so propagation can't interleave with an in-flight grant.
+    Preview only reports the rename. Correctness doesn't depend on
+    propagation: locks and sharing use `group_id`, and every UC call
+    re-resolves the current name.
   * **No longer account-level**: the operation is blocked (400).
   * **Deleted**: the bundle is **blocked**, even if a new group with the same
     name exists. That is a different principal, and granting to or revoking
@@ -387,9 +406,9 @@ drives revocation.
 PGAPPNAME=test PYTHONPATH=src python -m pytest src/permissions_app/tests
 ```
 
-The repo has no CI. The concurrency and migration tests that need **real
-Postgres** semantics (READ COMMITTED, advisory locks) are skipped unless
-`UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
+The repo has no CI. The 9 concurrency, pool and migration tests that need
+**real Postgres** semantics (READ COMMITTED, advisory locks, a real
+connection pool) are skipped unless `UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
 
 ```bash
 initdb -D /tmp/ucg-pg -U postgres --auth=trust

@@ -759,6 +759,10 @@ class GenieGrantLedger(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     bundle_id: int = Field(index=True)
+    # Immutable SCIM id of the bundle's group: the key for per-grant locks and
+    # for "does another bundle still need this grant?". ``principal`` is the
+    # group's display name as last seen (informational; UC calls re-resolve it).
+    group_id: str = Field(default="", index=True)
     space_id: str = Field(index=True)
     principal: str = Field(index=True)
     # "genie_space" (ACL CAN_RUN) or a UC securable type: catalog/schema/table/volume.

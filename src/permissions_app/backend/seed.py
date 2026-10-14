@@ -154,6 +154,8 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
         every column and index already in place).
       * ``genie_grant_ledger.state`` is ADDed if missing; existing rows were all
         written after their grant succeeded, so they default to ``confirmed``.
+      * ``genie_grant_ledger.group_id`` (the lock / sharing key) is ADDed if
+        missing and backfilled from each row's bundle; its index is created.
       * the one-bundle-per-space UNIQUE index is created if missing. If the DB
         already holds several bundles for one space the migration FAILS LOUDLY
         (RuntimeError, aborting startup) naming them, rather than silently
@@ -177,6 +179,25 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
             )
         )
         logger.info(f"Added column {ledger}.state")
+    if "group_id" not in {c["name"] for c in insp.get_columns(ledger)}:
+        conn.execute(
+            text(f"ALTER TABLE {ledger} ADD COLUMN group_id VARCHAR NOT NULL DEFAULT ''")
+        )
+        logger.info(f"Added column {ledger}.group_id")
+    # Backfill (idempotent: only rows still missing it) from the owning bundle.
+    backfilled = conn.execute(
+        text(
+            f"UPDATE {ledger} SET group_id = (SELECT b.group_id FROM "
+            f"{GenieAccessBundle.__tablename__} b WHERE b.id = {ledger}.bundle_id) "
+            f"WHERE (group_id IS NULL OR group_id = '') AND EXISTS (SELECT 1 FROM "
+            f"{GenieAccessBundle.__tablename__} b WHERE b.id = {ledger}.bundle_id)"
+        )
+    ).rowcount
+    if backfilled:
+        logger.info(f"Backfilled group_id on {backfilled} {ledger} row(s)")
+    conn.execute(
+        text(f"CREATE INDEX IF NOT EXISTS ix_{ledger}_group_id ON {ledger} (group_id)")
+    )
 
     bundles = GenieAccessBundle.__tablename__
     if GENIE_BUNDLE_SPACE_UNIQUE not in {i["name"] for i in insp.get_indexes(bundles)}:

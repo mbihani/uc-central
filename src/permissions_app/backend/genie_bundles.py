@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound, PermissionDenied
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, col, select, text
+from sqlmodel import Session, select, text
 
 from .logger import logger
 from .models import (
@@ -467,29 +467,66 @@ def resolve_bundle_group(
 def _rename_principal(session: Session, bundle: GenieAccessBundle, new_name: str) -> None:
     """The group (same id) was renamed: UC grants follow the principal, so only
     the app's records need updating — every bundle on that group id, and every
-    ledger row that names the old principal for those bundles."""
+    ledger row of that group id.
+
+    Each ledger row is updated while holding ITS per-grant lock (keyed on the
+    group id), so a rename can never interleave with an in-flight grant on the
+    same row. The ledger name is informational only: identity, locking and
+    sharing all use ``group_id``, and every UC call re-resolves the current
+    name under the lock (``_current_principal``).
+    """
     old_name = bundle.group_name
+    gid = bundle.group_id
     bundles = session.exec(
-        select(GenieAccessBundle).where(GenieAccessBundle.group_id == bundle.group_id)
+        select(GenieAccessBundle).where(GenieAccessBundle.group_id == gid)
     ).all()
-    ids = [b.id for b in bundles if b.id is not None]
     for b in bundles:
         b.group_name = new_name
         session.add(b)
-    rows = session.exec(
-        select(GenieGrantLedger).where(
-            col(GenieGrantLedger.bundle_id).in_(ids),
-            GenieGrantLedger.principal == old_name,
-        )
-    ).all()
-    for r in rows:
-        r.principal = new_name
-        session.add(r)
     session.commit()
-    logger.info(
-        f"Group id {bundle.group_id} renamed '{old_name}' -> '{new_name}'; updated "
-        f"{len(bundles)} bundle(s) and {len(rows)} ledger row(s)"
+    keys = sorted(
+        {_key_of(r) for r in _ledger_for_group(session, gid)},
+        key=lambda k: grant_lock_key(gid, k),
     )
+    updated = 0
+    for key in keys:
+        with _grant_lock(session, gid, key):
+            for r in _ledger_for_grant(session, gid, key):
+                if r.principal != new_name:
+                    r.principal = new_name
+                    session.add(r)
+                    updated += 1
+            session.commit()
+    logger.info(
+        f"Group id {gid} renamed '{old_name}' -> '{new_name}'; updated "
+        f"{len(bundles)} bundle(s) and {updated} ledger row(s)"
+    )
+
+
+def _current_principal(ws: WorkspaceClient, group_id: str) -> str:
+    """The group's CURRENT display name, looked up by its immutable id.
+
+    Called inside each per-grant lock span right before a UC / ACL call, so a
+    grant or revoke is always addressed to the group the bundle was created
+    for — never to whatever group now carries an old name. Raises UCGrantError
+    if the id is gone or is no longer an account group.
+    """
+    try:
+        g = ws.groups.get(id=group_id)
+    except NotFound as e:
+        raise UCGrantError(
+            f"Group id {group_id} no longer exists; nothing was granted or revoked.",
+            not_found=True,
+        ) from e
+    except Exception as e:
+        raise UCGrantError(f"Could not look up group id {group_id} ({type(e).__name__}).") from e
+    rtype = g.meta.resource_type if g.meta else None
+    if rtype != ACCOUNT_GROUP_RESOURCE_TYPE or not g.display_name:
+        raise UCGrantError(
+            f"Group id {group_id} is no longer an account-level group; nothing was "
+            f"granted or revoked."
+        )
+    return g.display_name
 
 
 # ─── Space ACL helpers ───────────────────────────────────────────────────────
@@ -521,80 +558,102 @@ def _space_error(e: Exception, action: str, space_id: str) -> str:
 #
 # Every ledger decision about ONE grant — "does anyone else still rely on it?",
 # deleting/adding a row, and the revoke/grant decision that follows — runs while
-# holding a lock keyed on (principal, securable_type, full_name, privilege).
-# Two bundles sharing a table / schema / catalog grant that are deleted or
-# resynced concurrently therefore can never both see the other's row, both
+# holding a lock keyed on the IMMUTABLE group id plus (securable_type,
+# full_name, privilege). Keying on the id (not the mutable display name) means a
+# group rename cannot let a second operation take a "different" lock for the
+# same grant. Two bundles sharing a table / schema / catalog grant that are
+# deleted or resynced concurrently can never both see the other's row, both
 # drop their own, and orphan an app-created grant.
 
 _LOCAL_LOCKS: dict[int, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 
 
-def grant_lock_key(principal: str, key: GrantKey) -> int:
+def grant_lock_key(group_id: str, key: GrantKey) -> int:
     """Stable signed 64-bit key for ``pg_advisory_lock`` (same on every
-    worker/process, unlike ``hash()``)."""
+    worker/process, unlike ``hash()``), derived from the group's immutable id."""
     raw = "\x1f".join(
-        ["genie-grant", principal, key.securable_type, key.full_name, key.privilege]
+        ["genie-grant", group_id, key.securable_type, key.full_name, key.privilege]
     ).encode()
     return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
 
 
 _HELD_LOCKS = "genie_grant_locks_held"
+_LOCK_CONN = "genie_grant_lock_conn"
 
 
 @contextmanager
-def _grant_lock(session: Session, principal: str, key: GrantKey) -> Iterator[None]:
+def _grant_lock(session: Session, group_id: str, key: GrantKey) -> Iterator[None]:
     """Hold the per-grant lock across the WHOLE block — including commits and
     workspace calls inside it.
 
-    Postgres (production): a SESSION-level ``pg_advisory_lock`` taken on a
-    DEDICATED pooled connection (not the ORM session's), so the body can commit
-    as often as it needs to (e.g. pending row -> grant call -> confirm) while
-    the lock stays held. ``pg_advisory_unlock`` always runs in ``finally``; if
-    the unlock itself fails the lock connection is invalidated (its backend is
-    closed, which releases the lock) instead of going back to the pool still
+    Postgres (production): a SESSION-level ``pg_advisory_lock`` on a dedicated
+    pooled connection, and — while it is held — the ORM session is BOUND to that
+    same connection. So the body can commit as often as it needs to (pending
+    row -> grant call -> confirm) while the lock stays held, and each operation
+    uses exactly ONE pooled connection (no lock-connection + ORM-connection
+    pair that could exhaust the pool under concurrency). ``pg_advisory_unlock``
+    always runs in ``finally``; if it fails, the connection is invalidated (its
+    backend closes, releasing the lock) instead of returning to the pool still
     holding it. Other dialects (SQLite in tests / local dev): a process-local
     lock with the same scope.
 
-    Deadlock safety: an operation holds at most one grant lock at a time today;
-    if a caller ever nests them, keys must be taken in ascending order, which is
-    enforced here (RuntimeError otherwise).
+    Deadlock safety: an operation holds at most one grant lock at a time; if a
+    caller ever nests them (same session, same connection), keys must be taken
+    in ascending order, which is enforced (RuntimeError otherwise).
     """
-    k = grant_lock_key(principal, key)
+    k = grant_lock_key(group_id, key)
     held: list[int] = session.info.setdefault(_HELD_LOCKS, [])
     if held and k <= max(held):
         raise RuntimeError("Grant locks must be acquired in ascending key order.")
     if session.in_transaction():
         # Start the locked section on a fresh transaction (callers have already
-        # committed their work; this just ends any read-only snapshot).
+        # committed their work; this just ends any read-only snapshot and
+        # returns the session's own pooled connection).
         session.commit()
+    outermost = not held
     held.append(k)
     try:
         engine = session.get_bind().engine
-        if engine.dialect.name == "postgresql":
-            with engine.connect() as lock_conn:
-                lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": k})
-                lock_conn.commit()
+        if engine.dialect.name != "postgresql":
+            with _LOCAL_LOCKS_GUARD:
+                lock = _LOCAL_LOCKS.setdefault(k, threading.Lock())
+            with lock:
                 try:
                     yield
                 finally:
                     if session.in_transaction():
                         session.rollback()
-                    try:
-                        lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": k})
-                        lock_conn.commit()
-                    except Exception:
-                        lock_conn.invalidate()
-                        raise
             return
-        with _LOCAL_LOCKS_GUARD:
-            lock = _LOCAL_LOCKS.setdefault(k, threading.Lock())
-        with lock:
+
+        if outermost:
+            lock_conn = engine.connect()
+            session.info[_LOCK_CONN] = (lock_conn, session.bind)
+        else:
+            lock_conn = session.info[_LOCK_CONN][0]
+        try:
+            lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": k})
+            lock_conn.commit()
+            if outermost:
+                session.bind = lock_conn  # ORM work shares the lock connection
             try:
                 yield
             finally:
                 if session.in_transaction():
                     session.rollback()
+                try:
+                    lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": k})
+                    lock_conn.commit()
+                except Exception:
+                    lock_conn.invalidate()
+                    raise
+        finally:
+            if outermost:
+                _, original_bind = session.info.pop(_LOCK_CONN)
+                if session.in_transaction():
+                    session.rollback()
+                session.bind = original_bind
+                lock_conn.close()
     finally:
         held.remove(k)
 
@@ -632,8 +691,18 @@ def _ledger_for_bundle(session: Session, bundle_id: int) -> list[GenieGrantLedge
     )
 
 
+def _ledger_for_group(session: Session, group_id: str) -> list[GenieGrantLedger]:
+    return list(
+        session.exec(
+            select(GenieGrantLedger)
+            .where(GenieGrantLedger.group_id == group_id)
+            .execution_options(populate_existing=True)
+        ).all()
+    )
+
+
 def _ledger_for_grant(
-    session: Session, principal: str, key: GrantKey
+    session: Session, group_id: str, key: GrantKey
 ) -> list[GenieGrantLedger]:
     # populate_existing: inside a lock we must see what other workers committed,
     # not attribute values cached in this session's identity map.
@@ -641,7 +710,7 @@ def _ledger_for_grant(
         session.exec(
             select(GenieGrantLedger)
             .where(
-                GenieGrantLedger.principal == principal,
+                GenieGrantLedger.group_id == group_id,
                 GenieGrantLedger.securable_type == key.securable_type,
                 GenieGrantLedger.full_name == key.full_name,
                 GenieGrantLedger.privilege == key.privilege,
@@ -652,10 +721,10 @@ def _ledger_for_grant(
 
 
 def _own_row(
-    session: Session, bundle_id: int, principal: str, key: GrantKey
+    session: Session, bundle_id: int, group_id: str, key: GrantKey
 ) -> GenieGrantLedger | None:
     return next(
-        (r for r in _ledger_for_grant(session, principal, key) if r.bundle_id == bundle_id),
+        (r for r in _ledger_for_grant(session, group_id, key) if r.bundle_id == bundle_id),
         None,
     )
 
@@ -733,19 +802,15 @@ def build_plan(
 
     With ``persist_rename=False`` (preview) it performs NO database writes
     either: a group rename is detected and reported, and the ledger is read
-    under the stored (old) principal name. apply / resync pass True so the
-    rename is propagated before anything is granted.
+    by group id, so it is unaffected by the rename. apply / resync pass True so
+    the rename is propagated to the app's records.
     """
     plan = BundlePlan(space_title=bundle.space_title)
 
-    # Captured BEFORE resolution: the name the ledger rows currently carry.
-    ledger_principal = bundle.group_name
     plan.group = resolve_bundle_group(ws, session, bundle, persist_rename=persist_rename)
     if plan.group.error:
         plan.blockers.append(plan.group.error)
     principal = plan.group.group_name  # CURRENT name: what UC grants use
-    if persist_rename:
-        ledger_principal = principal
     if plan.group.renamed_from and not persist_rename:
         plan.warnings.append(
             f"Group id {bundle.group_id} was renamed '{plan.group.renamed_from}' -> "
@@ -841,7 +906,7 @@ def build_plan(
             continue
         if not present:
             plan.evaluated.append(_Evaluated(key, "missing", detail))
-        elif any(r.app_granted for r in _ledger_for_grant(session, ledger_principal, key)):
+        elif any(r.app_granted for r in _ledger_for_grant(session, bundle.group_id, key)):
             plan.evaluated.append(_Evaluated(key, "managed", detail))
         else:
             plan.evaluated.append(_Evaluated(key, "present", detail))
@@ -887,7 +952,6 @@ def reconcile_pending(
     ws: WorkspaceClient,
     session: Session,
     bundle: GenieAccessBundle,
-    principal: str,
     result: GenieBundleActionOut,
 ) -> None:
     """Resolve PENDING rows left behind by an apply that died mid-grant.
@@ -915,11 +979,13 @@ def reconcile_pending(
             continue
         key = _key_of(row)
         try:
-            with _grant_lock(session, principal, key):
-                own = _own_row(session, bundle.id or 0, principal, key)
+            with _grant_lock(session, bundle.group_id, key):
+                own = _own_row(session, bundle.id or 0, bundle.group_id, key)
                 if own is None or own.state != LEDGER_PENDING:
                     session.commit()
                     continue
+                principal = _current_principal(ws, bundle.group_id)
+                own.principal = principal
                 present, _ = _is_present(ws, principal, key)
                 if present:
                     own.state = LEDGER_CONFIRMED
@@ -972,19 +1038,21 @@ def apply_plan(
         warnings=list(plan.warnings),
     )
     assert plan.group is not None and not plan.group.error
-    principal = plan.group.group_name
+    gid = bundle.group_id
     bundle_id = bundle.id or 0
 
-    reconcile_pending(ws, session, bundle, principal, result)
+    reconcile_pending(ws, session, bundle, result)
 
     for ev in plan.evaluated:
         if ev.status == "error":
             result.errors.append(ev.detail or f"Could not evaluate {ev.key}.")
             continue
         key = ev.key
-        with _grant_lock(session, principal, key):
-            own = _own_row(session, bundle_id, principal, key)
+        with _grant_lock(session, gid, key):
+            own = _own_row(session, bundle_id, gid, key)
             try:
+                # Resolved by id UNDER the lock: the name UC calls must use now.
+                principal = _current_principal(ws, gid)
                 present, detail = _is_present(ws, principal, key)
             except UCGrantError as e:
                 result.errors.append(str(e))
@@ -1004,6 +1072,7 @@ def apply_plan(
                 # a crash can never leave an unproven row marked app-granted.
                 own = _new_row(bundle, principal, key, actor, app_granted=False)
             own.state = LEDGER_PENDING
+            own.principal = principal
             session.add(own)
             _commit(session)  # durable BEFORE the workspace call
             row_id = own.id
@@ -1016,8 +1085,12 @@ def apply_plan(
                 )
                 continue
 
+            _after_pending_commit(key)
             granted_error: UCGrantError | None = None
             try:
+                # Re-resolve right before the call: the group may have been
+                # renamed while this span held the lock (renames are external).
+                principal = _current_principal(ws, gid)
                 _grant(ws, principal, key)
             except UCGrantError as e:
                 logger.error(f"Genie bundle {bundle_id}: {e}")
@@ -1028,6 +1101,7 @@ def apply_plan(
                 if granted_error is None:
                     row.state = LEDGER_CONFIRMED
                     row.app_granted = True  # proven: this process just issued it
+                    row.principal = principal
                     session.add(row)
                 elif previous is not None:
                     row.app_granted, row.state = previous
@@ -1047,11 +1121,17 @@ def apply_plan(
     return result
 
 
+def _after_pending_commit(key: GrantKey) -> None:
+    """No-op seam: called right after a pending row is committed and before the
+    workspace grant, while the per-grant lock is held (tests pause here)."""
+
+
 def _new_row(
     bundle: GenieAccessBundle, principal: str, key: GrantKey, actor: str, *, app_granted: bool
 ) -> GenieGrantLedger:
     return GenieGrantLedger(
         bundle_id=bundle.id or 0,
+        group_id=bundle.group_id,
         space_id=bundle.space_id,
         principal=principal,
         securable_type=key.securable_type,
@@ -1119,15 +1199,16 @@ def _release_rows(
     PENDING row from another bundle counts as "still needed". A row whose revoke
     fails is KEPT (the transaction rolls back) so the operation can be retried.
     """
-    plan = [(r.id, r.bundle_id, r.principal, _key_of(r)) for r in rows]
+    plan = [(r.id, r.bundle_id, r.group_id, _key_of(r)) for r in rows]
     plan.sort(key=lambda t: -_TYPE_ORDER.get(t[3].securable_type, 9))
-    for row_id, bundle_id, principal, key in plan:
-        with _grant_lock(session, principal, key):
+    for row_id, bundle_id, gid, key in plan:
+        with _grant_lock(session, gid, key):
             row = session.get(GenieGrantLedger, row_id, populate_existing=True)
             if row is None:
                 session.commit()
                 continue
-            others = [r for r in _ledger_for_grant(session, principal, key) if r.bundle_id != bundle_id]
+            # "Still needed" is decided by group ID, never by display name.
+            others = [r for r in _ledger_for_grant(session, gid, key) if r.bundle_id != bundle_id]
             if others:
                 if row.app_granted and not any(o.app_granted for o in others):
                     # Hand ownership of the app-issued grant to a remaining bundle.
@@ -1141,7 +1222,8 @@ def _release_rows(
                 continue
             if row.app_granted:
                 try:
-                    _revoke(ws, principal, key, result)
+                    # Resolved by id UNDER the lock — never the stored name.
+                    _revoke(ws, _current_principal(ws, gid), key, result)
                 except UCGrantError as e:
                     logger.error(f"Genie bundle {bundle_id}: {e}")
                     result.errors.append(str(e))
@@ -1188,7 +1270,7 @@ def delete_bundle(
     if group.error:
         raise BundleBlocked(group.error)
     result = GenieBundleActionOut(bundle_id=bundle.id or 0, action="delete", status="ok")
-    reconcile_pending(ws, session, bundle, group.group_name, result)
+    reconcile_pending(ws, session, bundle, result)
     _release_rows(ws, session, _ledger_for_bundle(session, bundle.id or 0), result)
     if not result.errors and not _ledger_for_bundle(session, bundle.id or 0):
         session.delete(bundle)
