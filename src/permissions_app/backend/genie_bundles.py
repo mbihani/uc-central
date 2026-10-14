@@ -25,15 +25,21 @@ needed (``app_granted=False``) but never revoked.
 
 import json
 import re
+import hashlib
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound, PermissionDenied
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select, text
 
 from .logger import logger
 from .models import (
+    LEDGER_CONFIRMED,
+    LEDGER_PENDING,
     GenieAccessBundle,
     GenieBundleActionOut,
     GenieBundlePreviewOut,
@@ -373,6 +379,109 @@ def check_group(ws: WorkspaceClient, group_name: str) -> GenieGroupCheckOut:
     )
 
 
+# ─── Group identity ──────────────────────────────────────────────────────────
+
+
+def resolve_bundle_group(
+    ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
+) -> GenieGroupCheckOut:
+    """Resolve the bundle's group by its immutable SCIM id — never by name.
+
+    Run before every preview / apply / resync / delete / membership operation:
+
+      * the id must still exist and still be an ACCOUNT group;
+      * its CURRENT display name is what UC grants are issued to; if the group
+        was renamed, the bundle and its ledger rows are updated in place;
+      * if the id is gone the bundle is blocked — even if a new group with the
+        same name exists, because that is a different principal and granting
+        to (or revoking from) it would act on someone else's access.
+    """
+    def blocked(error: str) -> GenieGroupCheckOut:
+        return GenieGroupCheckOut(
+            group_name=bundle.group_name,
+            group_id=bundle.group_id or None,
+            exists=False,
+            is_account_group=False,
+            error=error,
+        )
+
+    if not bundle.group_id:
+        return blocked("This bundle has no stored group id; delete it and create a new bundle.")
+    try:
+        g = ws.groups.get(id=bundle.group_id)
+    except NotFound:
+        return blocked(
+            (
+                f"The account group this bundle was created for (id "
+                f"{bundle.group_id}, last known as '{bundle.group_name}') no longer "
+                f"exists. UC Central will not grant to, or revoke from, a different "
+                f"group — even one recreated with the same name. Delete this bundle "
+                f"with 'forget orphaned' (drops its records without touching the "
+                f"workspace), then create a new bundle for the new group."
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Could not look up group id {bundle.group_id}: {e}")
+        return blocked(f"Could not look up the bundle's group ({type(e).__name__}).")
+
+    resource_type = g.meta.resource_type if g.meta else None
+    current = g.display_name or bundle.group_name
+    if resource_type != ACCOUNT_GROUP_RESOURCE_TYPE:
+        return GenieGroupCheckOut(
+            group_name=current,
+            group_id=bundle.group_id,
+            exists=True,
+            is_account_group=False,
+            resource_type=resource_type,
+            error=(
+                f"Group '{current}' (id {bundle.group_id}) is "
+                + (
+                    "a workspace-local group"
+                    if resource_type == WORKSPACE_GROUP_RESOURCE_TYPE
+                    else f"not a confirmed account-level group (SCIM resourceType={resource_type!r})"
+                )
+                + "; Unity Catalog can only grant to ACCOUNT-level groups."
+            ),
+        )
+    if current != bundle.group_name:
+        _rename_principal(session, bundle, current)
+    return GenieGroupCheckOut(
+        group_name=current,
+        group_id=bundle.group_id,
+        exists=True,
+        is_account_group=True,
+        resource_type=resource_type,
+    )
+
+
+def _rename_principal(session: Session, bundle: GenieAccessBundle, new_name: str) -> None:
+    """The group (same id) was renamed: UC grants follow the principal, so only
+    the app's records need updating — every bundle on that group id, and every
+    ledger row that names the old principal for those bundles."""
+    old_name = bundle.group_name
+    bundles = session.exec(
+        select(GenieAccessBundle).where(GenieAccessBundle.group_id == bundle.group_id)
+    ).all()
+    ids = [b.id for b in bundles if b.id is not None]
+    for b in bundles:
+        b.group_name = new_name
+        session.add(b)
+    rows = session.exec(
+        select(GenieGrantLedger).where(
+            col(GenieGrantLedger.bundle_id).in_(ids),
+            GenieGrantLedger.principal == old_name,
+        )
+    ).all()
+    for r in rows:
+        r.principal = new_name
+        session.add(r)
+    session.commit()
+    logger.info(
+        f"Group id {bundle.group_id} renamed '{old_name}' -> '{new_name}'; updated "
+        f"{len(bundles)} bundle(s) and {len(rows)} ledger row(s)"
+    )
+
+
 # ─── Space ACL helpers ───────────────────────────────────────────────────────
 
 
@@ -398,7 +507,75 @@ def _space_error(e: Exception, action: str, space_id: str) -> str:
     return f"Failed to {action} on Genie space '{space_id}' ({type(e).__name__})."
 
 
+# ─── Per-grant serialization ─────────────────────────────────────────────────
+#
+# Every ledger decision about ONE grant — "does anyone else still rely on it?",
+# deleting/adding a row, and the revoke/grant decision that follows — runs while
+# holding a lock keyed on (principal, securable_type, full_name, privilege).
+# Two bundles sharing a table / schema / catalog grant that are deleted or
+# resynced concurrently therefore can never both see the other's row, both
+# drop their own, and orphan an app-created grant.
+
+_LOCAL_LOCKS: dict[int, threading.Lock] = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
+
+
+def grant_lock_key(principal: str, key: GrantKey) -> int:
+    """Stable signed 64-bit key for ``pg_advisory_xact_lock`` (same on every
+    worker/process, unlike ``hash()``)."""
+    raw = "\x1f".join(
+        ["genie-grant", principal, key.securable_type, key.full_name, key.privilege]
+    ).encode()
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
+
+
+@contextmanager
+def _grant_lock(session: Session, principal: str, key: GrantKey) -> Iterator[None]:
+    """Hold the per-grant lock for the duration of ONE transaction.
+
+    Postgres (production): ``pg_advisory_xact_lock`` — cross-worker, released
+    automatically when the transaction commits or rolls back, so the body must
+    finish its decision with ``session.commit()``. Other dialects (SQLite in
+    tests / local dev): a process-local lock with the same scope. Anything left
+    uncommitted when the body exits (e.g. on error) is rolled back, so the lock
+    is never held past the block.
+    """
+    k = grant_lock_key(principal, key)
+    if session.get_bind().dialect.name == "postgresql":
+        try:
+            session.connection().execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": k})
+            yield
+        finally:
+            if session.in_transaction():
+                session.rollback()
+        return
+    with _LOCAL_LOCKS_GUARD:
+        lock = _LOCAL_LOCKS.setdefault(k, threading.Lock())
+    with lock:
+        try:
+            yield
+        finally:
+            if session.in_transaction():
+                session.rollback()
+
+
 # ─── Ledger helpers ──────────────────────────────────────────────────────────
+
+LEDGER_UNIQUE = "uq_genie_grant_ledger_bundle_grant"
+
+
+def is_unique_violation(exc: IntegrityError, constraint: str, table: str) -> bool:
+    """True only for the specific UNIQUE conflict we expect — never for other
+    integrity errors (NOT NULL, FK, a different constraint), which must surface.
+    Postgres/psycopg reports the constraint (or unique index) name; SQLite only
+    names the table's columns."""
+    orig = exc.orig
+    diag = getattr(orig, "diag", None)
+    name = getattr(diag, "constraint_name", None) if diag is not None else None
+    if name:
+        return name == constraint
+    msg = str(orig)
+    return msg.startswith("UNIQUE constraint failed") and f" {table}." in msg
 
 
 def _key_of(row: GenieGrantLedger) -> GrantKey:
@@ -408,7 +585,9 @@ def _key_of(row: GenieGrantLedger) -> GrantKey:
 def _ledger_for_bundle(session: Session, bundle_id: int) -> list[GenieGrantLedger]:
     return list(
         session.exec(
-            select(GenieGrantLedger).where(GenieGrantLedger.bundle_id == bundle_id)
+            select(GenieGrantLedger)
+            .where(GenieGrantLedger.bundle_id == bundle_id)
+            .execution_options(populate_existing=True)
         ).all()
     )
 
@@ -416,25 +595,40 @@ def _ledger_for_bundle(session: Session, bundle_id: int) -> list[GenieGrantLedge
 def _ledger_for_grant(
     session: Session, principal: str, key: GrantKey
 ) -> list[GenieGrantLedger]:
+    # populate_existing: inside a lock we must see what other workers committed,
+    # not attribute values cached in this session's identity map.
     return list(
         session.exec(
-            select(GenieGrantLedger).where(
+            select(GenieGrantLedger)
+            .where(
                 GenieGrantLedger.principal == principal,
                 GenieGrantLedger.securable_type == key.securable_type,
                 GenieGrantLedger.full_name == key.full_name,
                 GenieGrantLedger.privilege == key.privilege,
             )
+            .execution_options(populate_existing=True)
         ).all()
     )
 
 
-def _commit_row(session: Session, row: GenieGrantLedger) -> None:
-    session.add(row)
+def _own_row(
+    session: Session, bundle_id: int, principal: str, key: GrantKey
+) -> GenieGrantLedger | None:
+    return next(
+        (r for r in _ledger_for_grant(session, principal, key) if r.bundle_id == bundle_id),
+        None,
+    )
+
+
+def _commit(session: Session) -> None:
+    """Commit; an expected (bundle, grant) UNIQUE conflict means the row is
+    already recorded and is tolerated — every other integrity error raises."""
     try:
         session.commit()
-    except IntegrityError:
-        # A concurrent apply of the same bundle already recorded it.
+    except IntegrityError as e:
         session.rollback()
+        if not is_unique_violation(e, LEDGER_UNIQUE, GenieGrantLedger.__tablename__):
+            raise
 
 
 def _grant_out(key: GrantKey, status: str, detail: str | None = None) -> GenieGrantOut:
@@ -447,40 +641,94 @@ def _grant_out(key: GrantKey, status: str, detail: str | None = None) -> GenieGr
     )
 
 
+# ─── Presence ────────────────────────────────────────────────────────────────
+
+
+def _is_present(
+    ws: WorkspaceClient,
+    principal: str,
+    key: GrantKey,
+    cache: dict[tuple[str, str], list] | None = None,
+) -> tuple[bool, str | None]:
+    """Whether ``principal`` already effectively holds ``key``. Raises UCGrantError."""
+    if key.securable_type == GENIE_SPACE:
+        try:
+            level = _space_direct_level(ws, key.full_name, principal)
+        except Exception as e:
+            raise UCGrantError(
+                _space_error(e, "read the ACL", key.full_name),
+                permission_denied=isinstance(e, PermissionDenied),
+                not_found=isinstance(e, NotFound),
+            ) from e
+        return level in _SPACE_SATISFYING, (f"group holds {level}" if level else None)
+    ck = (key.securable_type, key.full_name)
+    if cache is not None and ck in cache:
+        privs = cache[ck]
+    else:
+        privs = effective_privileges(ws, key.securable_type, key.full_name, principal)
+        if cache is not None:
+            cache[ck] = privs
+    hit = find_effective(privs, key.privilege)
+    if hit is None:
+        return False, None
+    parts = [hit.privilege]
+    if hit.inherited_from:
+        parts.append(f"inherited from {hit.inherited_from}")
+    if hit.via_principal and hit.via_principal != principal:
+        parts.append(f"via {hit.via_principal}")
+    return True, ", ".join(parts)
+
+
 # ─── Plan ────────────────────────────────────────────────────────────────────
 
 
 def build_plan(
     ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
 ) -> BundlePlan:
-    """Compute everything the preview shows — with ZERO writes."""
+    """Compute everything the preview shows. No workspace writes; the only DB
+    write is a rename of the bundle's group records (see resolve_bundle_group)."""
     plan = BundlePlan(space_title=bundle.space_title)
 
-    plan.group = check_group(ws, bundle.group_name)
+    plan.group = resolve_bundle_group(ws, session, bundle)
     if plan.group.error:
         plan.blockers.append(plan.group.error)
+    principal = plan.group.group_name
 
+    serialized: str | None = None
     try:
         space = ws.genie.get_space(bundle.space_id, include_serialized_space=True)
         plan.space_title = space.title or bundle.space_title
         plan.warehouse_id = space.warehouse_id
-        refs = parse_serialized_space(space.serialized_space)
+        serialized = space.serialized_space
+        refs = parse_serialized_space(serialized)
+        space_read = True
     except ValueError as e:
         plan.blockers.append(f"Could not parse the Genie space definition: {e}")
-        refs = []
+        refs, space_read = [], False
     except PermissionDenied:
         plan.blockers.append(
             f"The app service principal cannot read Genie space '{bundle.space_id}' "
             f"(it needs CAN_MANAGE on the space to read its definition and set its ACL)."
         )
-        refs = []
+        refs, space_read = [], False
     except NotFound:
         plan.blockers.append(f"Genie space '{bundle.space_id}' was not found.")
-        refs = []
+        refs, space_read = [], False
 
     plan.objects = resolve_objects(ws, refs)
-    if refs and not any(o.resolved for o in plan.objects):
-        plan.blockers.append("None of the space's data sources could be resolved.")
+    if space_read and not any(o.resolved for o in plan.objects):
+        # CAN_RUN on a space whose tables the group cannot read is useless, and
+        # an empty plan usually means the definition format was not understood.
+        if not serialized:
+            reason = "the space definition (serialized_space) was not returned"
+        elif not refs:
+            reason = (
+                "no data sources were found (data_sources is absent or empty, or "
+                "the definition format is not recognized)"
+            )
+        else:
+            reason = "none of the space's data sources could be resolved"
+        plan.blockers.append(f"Nothing to grant: {reason}.")
     for o in plan.objects:
         if not o.resolved:
             plan.warnings.append(
@@ -492,7 +740,7 @@ def build_plan(
         plan.warnings.append(
             f"{len(restricted)} table(s) already have a row filter or column mask; "
             f"those functions run as the asking user, so check that members of "
-            f"'{bundle.group_name}' see the intended rows/columns."
+            f"'{principal}' see the intended rows/columns."
         )
     if plan.warehouse_id:
         plan.warnings.append(
@@ -500,76 +748,45 @@ def build_plan(
             f"access is not managed by the bundle."
         )
     mapped = session.exec(
-        select(PersonaGroupMapping).where(
-            PersonaGroupMapping.group_name == bundle.group_name
-        )
+        select(PersonaGroupMapping).where(PersonaGroupMapping.group_name == principal)
     ).first()
     if mapped:
         plan.warnings.append(
-            f"'{bundle.group_name}' is also mapped to persona '{mapped.persona}'. "
+            f"'{principal}' is also mapped to persona '{mapped.persona}'. "
             f"Applying that persona rewrites this group's Genie-space ACL; use a "
             f"dedicated group for the bundle."
         )
 
     required = required_grants(bundle.space_id, plan.objects)
     own_rows = _ledger_for_bundle(session, bundle.id or 0)
+    pending = [r for r in own_rows if r.state == LEDGER_PENDING]
+    if pending:
+        plan.warnings.append(
+            f"{len(pending)} grant(s) from an interrupted apply are PENDING; the next "
+            f"apply/resync/delete reconciles them against the workspace."
+        )
     required_set = set(required)
     plan.stale_rows = [r for r in own_rows if _key_of(r) not in required_set]
 
-    if plan.blockers and plan.group and not plan.group.is_account_group:
-        # Cannot evaluate grants for a principal UC does not know about.
+    if plan.group.error:
+        # Never look up (or later act on) grants for an unverified principal.
         plan.evaluated = [_Evaluated(k, "missing") for k in required]
         return plan
 
-    effective_cache: dict[tuple[str, str], list] = {}
+    cache: dict[tuple[str, str], list] = {}
     for key in required:
-        plan.evaluated.append(
-            _evaluate(ws, session, bundle, key, effective_cache)
-        )
-    return plan
-
-
-def _evaluate(
-    ws: WorkspaceClient,
-    session: Session,
-    bundle: GenieAccessBundle,
-    key: GrantKey,
-    cache: dict[tuple[str, str], list],
-) -> _Evaluated:
-    principal = bundle.group_name
-    try:
-        if key.securable_type == GENIE_SPACE:
-            level = _space_direct_level(ws, key.full_name, principal)
-            present = level in _SPACE_SATISFYING
-            detail = f"group holds {level}" if level else None
+        try:
+            present, detail = _is_present(ws, principal, key, cache)
+        except UCGrantError as e:
+            plan.evaluated.append(_Evaluated(key, "error", str(e)))
+            continue
+        if not present:
+            plan.evaluated.append(_Evaluated(key, "missing", detail))
+        elif any(r.app_granted for r in _ledger_for_grant(session, principal, key)):
+            plan.evaluated.append(_Evaluated(key, "managed", detail))
         else:
-            ck = (key.securable_type, key.full_name)
-            if ck not in cache:
-                cache[ck] = effective_privileges(
-                    ws, key.securable_type, key.full_name, principal
-                )
-            hit = find_effective(cache[ck], key.privilege)
-            present = hit is not None
-            detail = None
-            if hit is not None:
-                via = hit.via_principal if hit.via_principal != principal else None
-                parts = [hit.privilege]
-                if hit.inherited_from:
-                    parts.append(f"inherited from {hit.inherited_from}")
-                if via:
-                    parts.append(f"via {via}")
-                detail = ", ".join(parts)
-    except UCGrantError as e:
-        return _Evaluated(key, "error", str(e))
-    except Exception as e:
-        return _Evaluated(key, "error", _space_error(e, "read the ACL", key.full_name))
-
-    if not present:
-        return _Evaluated(key, "missing", detail)
-    rows = _ledger_for_grant(session, principal, key)
-    if any(r.app_granted for r in rows):
-        return _Evaluated(key, "managed", detail)
-    return _Evaluated(key, "present", detail)
+            plan.evaluated.append(_Evaluated(key, "present", detail))
+    return plan
 
 
 def to_preview(bundle: GenieAccessBundle, plan: BundlePlan) -> GenieBundlePreviewOut:
@@ -607,6 +824,46 @@ def _grant(ws: WorkspaceClient, principal: str, key: GrantKey) -> None:
     add_privileges(ws, key.securable_type, key.full_name, principal, [key.privilege])
 
 
+def reconcile_pending(
+    ws: WorkspaceClient,
+    session: Session,
+    bundle: GenieAccessBundle,
+    principal: str,
+    result: GenieBundleActionOut,
+) -> None:
+    """Resolve PENDING rows left by an apply that died between writing the
+    pending row and confirming it (crash, DB failure after the grant call).
+
+    Under the per-grant lock: if the privilege is effective now, the grant went
+    through — CONFIRM the row (app-granted, so it stays revocable). If it is not,
+    the grant never happened — DROP the row. If the workspace cannot be read the
+    row stays pending and the error is reported.
+    """
+    for row in _ledger_for_bundle(session, bundle.id or 0):
+        if row.state != LEDGER_PENDING:
+            continue
+        key = _key_of(row)
+        try:
+            with _grant_lock(session, principal, key):
+                own = _own_row(session, bundle.id or 0, principal, key)
+                if own is None or own.state != LEDGER_PENDING:
+                    session.commit()
+                    continue
+                present, _ = _is_present(ws, principal, key)
+                if present:
+                    own.state = LEDGER_CONFIRMED
+                    own.app_granted = True
+                    session.add(own)
+                    session.commit()
+                    result.reconciled.append(_grant_out(key, "confirmed", "pending grant was applied"))
+                else:
+                    session.delete(own)
+                    session.commit()
+                    result.reconciled.append(_grant_out(key, "dropped", "pending grant was never applied"))
+        except UCGrantError as e:
+            result.errors.append(f"Could not reconcile pending grant: {e}")
+
+
 def apply_plan(
     ws: WorkspaceClient,
     session: Session,
@@ -618,9 +875,12 @@ def apply_plan(
 ) -> GenieBundleActionOut:
     """Grant what is missing and record every required privilege in the ledger.
 
-    Idempotent: a second run finds everything ``present``/``managed`` and makes
-    no grant calls. With ``revoke_stale`` (resync) ledger rows that the
-    current space definition no longer needs are released afterwards.
+    Each grant is decided under its per-grant lock with a FRESH presence check
+    (the plan is advisory). A missing grant is recorded as a durable PENDING
+    row BEFORE the workspace call and CONFIRMED after it, so a crash in between
+    leaves a row that ``reconcile_pending`` resolves on the next run instead of
+    an untracked app-created grant. Idempotent: a second run makes no grant
+    calls. With ``revoke_stale`` (resync) rows no longer needed are released.
     """
     result = GenieBundleActionOut(
         bundle_id=bundle.id or 0,
@@ -628,67 +888,94 @@ def apply_plan(
         status="ok",
         warnings=list(plan.warnings),
     )
-    principal = bundle.group_name
+    assert plan.group is not None and not plan.group.error
+    principal = plan.group.group_name
     bundle_id = bundle.id or 0
 
+    reconcile_pending(ws, session, bundle, principal, result)
+
     for ev in plan.evaluated:
-        own = next(
-            (r for r in _ledger_for_grant(session, principal, ev.key) if r.bundle_id == bundle_id),
-            None,
-        )
         if ev.status == "error":
             result.errors.append(ev.detail or f"Could not evaluate {ev.key}.")
             continue
-        if ev.status == "missing":
-            try:
-                _grant(ws, principal, ev.key)
-            except UCGrantError as e:
-                logger.error(f"Genie bundle {bundle_id}: {e}")
-                result.errors.append(str(e))
-                continue
-            if own is not None:
+        key = ev.key
+        try:
+            with _grant_lock(session, principal, key):
+                own = _own_row(session, bundle_id, principal, key)
+                present, detail = _is_present(ws, principal, key)
+                if present:
+                    # Already effective: record that this bundle relies on it,
+                    # without taking ownership — only app-issued grants are revoked.
+                    if own is None:
+                        session.add(_new_row(bundle, principal, key, actor, app_granted=False))
+                        result.adopted.append(_grant_out(key, ev.status, detail))
+                    session.commit()
+                    continue
+                previous = (own.app_granted, own.state) if own is not None else None
+                if own is None:
+                    own = _new_row(bundle, principal, key, actor, app_granted=True)
                 own.app_granted = True
+                own.state = LEDGER_PENDING
                 session.add(own)
-                session.commit()
-            else:
-                _commit_row(
-                    session,
-                    GenieGrantLedger(
-                        bundle_id=bundle_id,
-                        space_id=bundle.space_id,
-                        principal=principal,
-                        securable_type=ev.key.securable_type,
-                        full_name=ev.key.full_name,
-                        privilege=ev.key.privilege,
-                        app_granted=True,
-                        granted_by=actor,
-                    ),
-                )
-            result.granted.append(_grant_out(ev.key, "granted"))
+                _commit(session)  # durable BEFORE the workspace call
+                row_id = own.id
+        except UCGrantError as e:
+            result.errors.append(str(e))
             continue
-        # Already effective: record that this bundle relies on it, but do not
-        # take ownership — only an app-issued grant is ever revoked.
-        if own is None:
-            _commit_row(
-                session,
-                GenieGrantLedger(
-                    bundle_id=bundle_id,
-                    space_id=bundle.space_id,
-                    principal=principal,
-                    securable_type=ev.key.securable_type,
-                    full_name=ev.key.full_name,
-                    privilege=ev.key.privilege,
-                    app_granted=False,
-                    granted_by=actor,
-                ),
+        if row_id is None:
+            # The expected UNIQUE conflict: a concurrent run recorded this exact
+            # row first. Do not grant without our own durable record; retry.
+            result.errors.append(
+                f"Grant {key.privilege} on {key.securable_type} '{key.full_name}' was "
+                f"recorded concurrently by another run; re-run apply."
             )
-            result.adopted.append(_grant_out(ev.key, ev.status, ev.detail))
+            continue
+
+        try:
+            _grant(ws, principal, key)
+            granted_error: UCGrantError | None = None
+        except UCGrantError as e:
+            logger.error(f"Genie bundle {bundle_id}: {e}")
+            granted_error = e
+
+        with _grant_lock(session, principal, key):
+            row = session.get(GenieGrantLedger, row_id, populate_existing=True)
+            if row is not None:
+                if granted_error is None:
+                    row.state = LEDGER_CONFIRMED
+                    session.add(row)
+                elif previous is not None:
+                    row.app_granted, row.state = previous
+                    session.add(row)
+                else:
+                    session.delete(row)
+            session.commit()
+        if granted_error is None:
+            result.granted.append(_grant_out(key, "granted"))
+        else:
+            result.errors.append(str(granted_error))
 
     if revoke_stale:
         _release_rows(ws, session, plan.stale_rows, result)
 
     _finish(result)
     return result
+
+
+def _new_row(
+    bundle: GenieAccessBundle, principal: str, key: GrantKey, actor: str, *, app_granted: bool
+) -> GenieGrantLedger:
+    return GenieGrantLedger(
+        bundle_id=bundle.id or 0,
+        space_id=bundle.space_id,
+        principal=principal,
+        securable_type=key.securable_type,
+        full_name=key.full_name,
+        privilege=key.privilege,
+        app_granted=app_granted,
+        state=LEDGER_CONFIRMED,
+        granted_by=actor,
+    )
 
 
 # ─── Release (revoke) ────────────────────────────────────────────────────────
@@ -738,53 +1025,87 @@ def _release_rows(
     result: GenieBundleActionOut,
 ) -> None:
     """Drop ledger rows, revoking a privilege only when the app granted it and
-    no other bundle still relies on it. A row whose revoke fails is KEPT so the
-    operation can be retried."""
-    for row in sorted(rows, key=lambda r: -_TYPE_ORDER.get(r.securable_type, 9)):
-        key = _key_of(row)
-        others = [
-            r for r in _ledger_for_grant(session, row.principal, key) if r.bundle_id != row.bundle_id
-        ]
-        if others:
-            if row.app_granted and not any(o.app_granted for o in others):
-                # Hand ownership of the app-issued grant to a remaining bundle.
-                others[0].app_granted = True
-                session.add(others[0])
-            session.delete(row)
-            session.commit()
-            result.released.append(
-                _grant_out(key, "released", f"still needed by bundle {others[0].bundle_id}")
-            )
-            continue
-        if row.app_granted:
-            try:
-                _revoke(ws, row.principal, key, result)
-            except UCGrantError as e:
-                logger.error(f"Genie bundle {row.bundle_id}: {e}")
-                result.errors.append(str(e))
+    no other bundle still relies on it.
+
+    The decision for each grant is ATOMIC under its per-grant lock: re-read the
+    other bundles' rows, drop this row, and revoke (if this was the last
+    app-granted user) — all in one transaction, so two bundles released
+    concurrently can never both conclude "the other one still needs it". A
+    PENDING row from another bundle counts as "still needed". A row whose revoke
+    fails is KEPT (the transaction rolls back) so the operation can be retried.
+    """
+    plan = [(r.id, r.bundle_id, r.principal, _key_of(r)) for r in rows]
+    plan.sort(key=lambda t: -_TYPE_ORDER.get(t[3].securable_type, 9))
+    for row_id, bundle_id, principal, key in plan:
+        with _grant_lock(session, principal, key):
+            row = session.get(GenieGrantLedger, row_id, populate_existing=True)
+            if row is None:
+                session.commit()
                 continue
-            session.delete(row)
-            session.commit()
-            result.revoked.append(_grant_out(key, "revoked"))
-        else:
-            session.delete(row)
-            session.commit()
-            result.released.append(
-                _grant_out(key, "released", "pre-existing grant; not created by the app, left in place")
-            )
+            others = [r for r in _ledger_for_grant(session, principal, key) if r.bundle_id != bundle_id]
+            if others:
+                if row.app_granted and not any(o.app_granted for o in others):
+                    # Hand ownership of the app-issued grant to a remaining bundle.
+                    others[0].app_granted = True
+                    session.add(others[0])
+                session.delete(row)
+                session.commit()
+                result.released.append(
+                    _grant_out(key, "released", f"still needed by bundle {others[0].bundle_id}")
+                )
+                continue
+            if row.app_granted:
+                try:
+                    _revoke(ws, principal, key, result)
+                except UCGrantError as e:
+                    logger.error(f"Genie bundle {bundle_id}: {e}")
+                    result.errors.append(str(e))
+                    session.rollback()
+                    continue
+                session.delete(row)
+                session.commit()
+                result.revoked.append(_grant_out(key, "revoked"))
+            else:
+                session.delete(row)
+                session.commit()
+                result.released.append(
+                    _grant_out(key, "released", "pre-existing grant; not created by the app, left in place")
+                )
+
+
+class BundleBlocked(Exception):
+    """The bundle's group can no longer be verified; nothing may be changed."""
 
 
 def delete_bundle(
-    ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
+    ws: WorkspaceClient,
+    session: Session,
+    bundle: GenieAccessBundle,
+    *,
+    forget_orphaned: bool = False,
 ) -> GenieBundleActionOut:
     """Release every ledger row (same safe-revoke rule), then delete the bundle.
 
+    Blocked (``BundleBlocked``) when the group id no longer resolves to an
+    account group: revoking by name could hit a same-named replacement group.
     If any revoke fails the bundle and the failed rows are kept, so nothing the
     app granted is ever orphaned without a ledger record.
+
+    ``forget_orphaned`` is the operator escape hatch for a bundle whose group
+    was DELETED (by-id lookup returns NotFound — never on a mere lookup error):
+    the ledger rows and the bundle are dropped WITHOUT any workspace call, so
+    the space can get a new bundle. The deleted principal's privileges cannot
+    be revoked by name safely; they are listed in the result for audit.
     """
+    group = resolve_bundle_group(ws, session, bundle)
+    if group.error and forget_orphaned:
+        return _forget_orphaned(ws, session, bundle)
+    if group.error:
+        raise BundleBlocked(group.error)
     result = GenieBundleActionOut(bundle_id=bundle.id or 0, action="delete", status="ok")
+    reconcile_pending(ws, session, bundle, group.group_name, result)
     _release_rows(ws, session, _ledger_for_bundle(session, bundle.id or 0), result)
-    if not result.errors:
+    if not result.errors and not _ledger_for_bundle(session, bundle.id or 0):
         session.delete(bundle)
         session.commit()
         result.deleted = True
@@ -792,7 +1113,44 @@ def delete_bundle(
     return result
 
 
+def _forget_orphaned(
+    ws: WorkspaceClient, session: Session, bundle: GenieAccessBundle
+) -> GenieBundleActionOut:
+    try:
+        ws.groups.get(id=bundle.group_id)
+    except NotFound:
+        pass
+    else:
+        raise BundleBlocked(
+            "forget_orphaned is only allowed when the bundle's group no longer exists."
+        )
+    result = GenieBundleActionOut(bundle_id=bundle.id or 0, action="delete", status="ok")
+    for row in _ledger_for_bundle(session, bundle.id or 0):
+        result.released.append(
+            _grant_out(
+                _key_of(row),
+                "forgotten",
+                f"group id {bundle.group_id} was deleted; record dropped, nothing revoked",
+            )
+        )
+        session.delete(row)
+    session.delete(bundle)
+    session.commit()
+    result.deleted = True
+    result.warnings.append(
+        f"Bundle records for deleted group id {bundle.group_id} ('{bundle.group_name}') "
+        f"were dropped without revoking anything."
+    )
+    return result
+
+
 def _finish(result: GenieBundleActionOut) -> None:
     if result.errors:
-        done = result.granted or result.revoked or result.released or result.adopted
+        done = (
+            result.granted
+            or result.revoked
+            or result.released
+            or result.adopted
+            or result.reconciled
+        )
         result.status = "partial" if done else "failed"

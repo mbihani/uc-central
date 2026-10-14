@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from .. import __version__
@@ -698,21 +698,31 @@ class PermissionConflictsOut(BaseModel):
 # did not create. See docs/genie-access-bundles.md.
 
 
+GENIE_BUNDLE_SPACE_UNIQUE = "uq_genie_access_bundle_space_id"
+
+# Grant-ledger row states. A PENDING row is written durably BEFORE the workspace
+# grant call and flipped to CONFIRMED after it, so a crash in between can be
+# reconciled instead of leaving an untracked app-created grant.
+LEDGER_PENDING = "pending"
+LEDGER_CONFIRMED = "confirmed"
+
+
 class GenieAccessBundle(SQLModel, table=True):
     """One Genie space <-> one account group."""
 
     __tablename__ = "genie_access_bundle"
-    # A space may have several bundles (one per group — e.g. a later
-    # per-region restriction step), but a (space, group) pair is unique.
+    # ONE group per space. A unique INDEX (not a table constraint) so the same
+    # DDL — CREATE UNIQUE INDEX IF NOT EXISTS — upgrades databases created before
+    # this rule existed (see seed.ensure_genie_bundle_schema).
     __table_args__ = (
-        UniqueConstraint(
-            "space_id", "group_name", name="uq_genie_access_bundle_space_group"
-        ),
+        Index(GENIE_BUNDLE_SPACE_UNIQUE, "space_id", unique=True),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     space_id: str = Field(index=True)
     space_title: str = ""
+    # group_id (immutable SCIM id) is the identity; group_name is the CURRENT
+    # display name, refreshed from group_id before every operation.
     group_name: str = Field(index=True)
     group_id: str = ""
     created_by: str = ""
@@ -756,6 +766,7 @@ class GenieGrantLedger(SQLModel, table=True):
     full_name: str = Field(index=True)
     privilege: str
     app_granted: bool = Field(default=True)
+    state: str = Field(default=LEDGER_CONFIRMED)  # LEDGER_PENDING | LEDGER_CONFIRMED
     granted_at: datetime = Field(default_factory=_utcnow)
     granted_by: str = ""
 
@@ -837,6 +848,8 @@ class GenieBundleActionOut(BaseModel):
     adopted: list[GenieGrantOut] = []
     revoked: list[GenieGrantOut] = []
     released: list[GenieGrantOut] = []
+    # PENDING rows from an interrupted run, confirmed or dropped this run.
+    reconciled: list[GenieGrantOut] = []
     errors: list[str] = []
     warnings: list[str] = []
     deleted: bool = False

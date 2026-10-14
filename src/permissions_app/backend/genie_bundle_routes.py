@@ -17,9 +17,19 @@ from sqlmodel import Session, func, select
 
 from .._metadata import api_prefix
 from .dependencies import AdminRequired, CurrentUserDep, SessionDep, get_obo_ws
-from .genie_bundles import apply_plan, build_plan, check_group, delete_bundle, to_preview
+from .genie_bundles import (
+    BundleBlocked,
+    apply_plan,
+    build_plan,
+    check_group,
+    delete_bundle,
+    is_unique_violation,
+    resolve_bundle_group,
+    to_preview,
+)
 from .logger import logger
 from .models import (
+    GENIE_BUNDLE_SPACE_UNIQUE,
     AddMemberIn,
     GenieAccessBundle,
     GenieBundleActionOut,
@@ -54,6 +64,28 @@ def _bundle_out(session: Session, b: GenieAccessBundle) -> GenieBundleOut:
     )
 
 
+def _one_per_space(space_id: str, group_name: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"Genie space '{space_id}' already has a bundle (group '{group_name}'). "
+            f"Each space has exactly one bundle group; add people to that group."
+        ),
+    )
+
+
+def _verified_bundle(
+    obo_ws: WorkspaceClient, session: Session, bundle_id: int
+) -> GenieAccessBundle:
+    """Load the bundle and re-verify its group BY ID (renames are picked up;
+    a deleted / non-account group blocks the request with a 400)."""
+    bundle = _get_bundle(session, bundle_id)
+    group = resolve_bundle_group(obo_ws, session, bundle)
+    if group.error:
+        raise HTTPException(status_code=400, detail=group.error)
+    return bundle
+
+
 def _get_bundle(session: Session, bundle_id: int) -> GenieAccessBundle:
     b = session.get(GenieAccessBundle, bundle_id)
     if b is None:
@@ -86,6 +118,12 @@ def create_genie_bundle(
     if not space_id or not group_name:
         raise HTTPException(status_code=400, detail="space_id and group_name are required.")
 
+    existing = session.exec(
+        select(GenieAccessBundle).where(GenieAccessBundle.space_id == space_id)
+    ).first()
+    if existing is not None:
+        raise _one_per_space(space_id, existing.group_name)
+
     group = check_group(obo_ws, group_name)
     if group.error:
         raise HTTPException(status_code=400, detail=group.error)
@@ -113,12 +151,11 @@ def create_genie_bundle(
     session.add(bundle)
     try:
         session.commit()
-    except IntegrityError:
+    except IntegrityError as e:
         session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"A bundle for group '{group_name}' on this space already exists.",
-        )
+        if not is_unique_violation(e, GENIE_BUNDLE_SPACE_UNIQUE, GenieAccessBundle.__tablename__):
+            raise
+        raise _one_per_space(space_id, group_name)  # lost a concurrent create
     session.refresh(bundle)
     return _bundle_out(session, bundle)
 
@@ -206,11 +243,20 @@ def delete_genie_bundle(
     bundle_id: int,
     obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     session: SessionDep,
+    forget_orphaned: bool = False,
     _admin: AdminRequired = True,
 ):
     """Release every ledger row with the safe-revoke rule, then delete the
-    bundle. The account group itself is never deleted."""
-    return delete_bundle(obo_ws, session, _get_bundle(session, bundle_id))
+    bundle. The account group itself is never deleted.
+
+    ``forget_orphaned=true`` is accepted only when the bundle's group id no
+    longer exists: the records are dropped without any workspace call."""
+    try:
+        return delete_bundle(
+            obo_ws, session, _get_bundle(session, bundle_id), forget_orphaned=forget_orphaned
+        )
+    except BundleBlocked as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ─── Membership (account group, via the workspace SCIM API) ─────────────────
@@ -250,7 +296,7 @@ def list_genie_bundle_members(
     session: SessionDep,
     _admin: AdminRequired = True,
 ):
-    bundle = _get_bundle(session, bundle_id)
+    bundle = _verified_bundle(obo_ws, session, bundle_id)
     try:
         g = obo_ws.groups.get(id=bundle.group_id)
     except Exception as e:
@@ -274,7 +320,7 @@ def add_genie_bundle_member(
     _admin: AdminRequired = True,
 ):
     """Onboard: add a user to the bundle's account group (idempotent)."""
-    bundle = _get_bundle(session, bundle_id)
+    bundle = _verified_bundle(obo_ws, session, bundle_id)
     try:
         changed = _set_group_membership(obo_ws, bundle.group_id, body.user_id, add=True)
     except Exception as e:
@@ -295,7 +341,7 @@ def remove_genie_bundle_member(
     _admin: AdminRequired = True,
 ):
     """Offboard: remove a user from the bundle's account group (idempotent)."""
-    bundle = _get_bundle(session, bundle_id)
+    bundle = _verified_bundle(obo_ws, session, bundle_id)
     try:
         changed = _set_group_membership(obo_ws, bundle.group_id, user_id, add=False)
     except Exception as e:

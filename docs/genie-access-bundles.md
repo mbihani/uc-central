@@ -36,7 +36,10 @@ create ─▶ preview ─▶ apply ─▶ (add members) ─▶ resync … ─▶
 
 * **Create** (`POST /api/genie-bundles`): takes a space id and an existing
   group name. Checks that the space exists and that the group exists in the
-  workspace as an **account** group. Writes nothing to the workspace.
+  workspace as an **account** group, then stores the group's immutable SCIM
+  **id**. Writes nothing to the workspace. **Each space has exactly one
+  bundle (one group).** A second bundle for the same space gets a 409; the
+  database enforces this with a unique index.
 * **Preview** (`GET /api/genie-bundles/{id}/preview`): read-only. It shows:
   * the space's data sources, each with its UC `table_type`;
   * any data source that can't be resolved, and why;
@@ -60,6 +63,8 @@ create ─▶ preview ─▶ apply ─▶ (add members) ─▶ resync … ─▶
   rules, then deletes the bundle. The account group itself is never deleted.
   If any revoke fails, the bundle and the failed rows are **kept** so the
   delete can be retried. Grants are never orphaned without a ledger record.
+* Every one of these operations, including membership changes, first
+  **re-resolves the group by its stored id** (see "Groups" below).
 
 ### Discovery
 
@@ -86,31 +91,84 @@ were confirmed against a live workspace:
   masks. Back-ticked parts are handled.
 * Some references can't be resolved: an object that was dropped, a name that
   isn't three-part, or one the app SP can't see. These are **listed in the
-  preview with a reason** and are not granted. If none of the data sources
-  resolves, apply is blocked.
+  preview with a reason** and are not granted.
+* **Nothing to grant blocks apply.** This happens when the definition isn't
+  returned, `data_sources` is absent or empty, the format isn't recognized
+  (no entries with an `identifier` / `path`), or none of the data sources
+  resolves. The preview shows a blocker that starts *"Nothing to grant"*, and
+  apply/resync return 400. A CAN_RUN-only grant would be useless.
 * SQL text in instructions or example queries is **not** parsed. Only declared
   data sources are granted.
 
 ### Grant ledger
 
-Two tables are stored in Lakebase. They are created idempotently at startup by
-`ensure_genie_bundle_schema` in `backend/seed.py`, using `create_all`
-(checkfirst). This works on a fresh database and never alters existing data.
+Two tables are stored in Lakebase. They are created or upgraded at startup by
+`ensure_genie_bundle_schema` in `backend/seed.py`, inside the existing
+advisory-locked bootstrap transaction. The migration is idempotent and never
+drops or rewrites data:
 
-* `genie_access_bundle` has one row per (space, group), with `UNIQUE (space_id,
-  group_name)`.
+* `create_all(checkfirst)` creates any missing table. On a fresh database,
+  every column and index is created in place.
+* On a database created by the first version of this feature, two upgrades
+  run:
+  * `genie_grant_ledger.state` is added with default `confirmed`. Those rows
+    were all written after their grant succeeded.
+  * The unique index `uq_genie_access_bundle_space_id` is created. **If that
+    database already has several bundles for one space, startup fails loudly**
+    with a `RuntimeError` naming each space and its bundle count. Nothing is
+    silently deleted, because those bundles' grants are in the ledger. Delete
+    the extras through the app (safe revoke) on the previous version, then
+    restart.
+
+The two tables:
+
+* `genie_access_bundle` has one row per space (unique index on `space_id`).
+  `group_id` is the group's identity; `group_name` is its current display name.
 * `genie_grant_ledger` has one row per privilege a bundle relies on. Its
-  columns are: `bundle_id`, `space_id`, `principal` (the group), `securable_type`
-  (`genie_space` / `catalog` / `schema` / `table` / `volume`), `full_name`,
-  `privilege`, `app_granted`, `granted_at`, `granted_by`. A UNIQUE constraint
-  covers (bundle, principal, securable, privilege).
+  columns are: `bundle_id`, `space_id`, `principal` (the group's current
+  name), `securable_type` (`genie_space` / `catalog` / `schema` / `table` /
+  `volume`), `full_name`, `privilege`, `app_granted`, `state`
+  (`pending` / `confirmed`), `granted_at`, `granted_by`. A UNIQUE constraint
+  covers (bundle, principal, securable, privilege). Only *that* uniqueness
+  conflict is treated as "already recorded"; any other integrity error is
+  raised.
 
 `app_granted = true` means UC Central issued the grant.
 `app_granted = false` means the privilege already existed when the bundle was
 applied. The bundle still records it so that **another bundle never revokes it
 out from under this one**, but the app never revokes it itself.
 
+### Grant-before-ledger: pending rows
+
+A grant the app is about to make is recorded first, as a durable **`pending`**
+row committed *before* the workspace call. It is flipped to **`confirmed`**
+after the call succeeds. If the call fails, the row is restored or removed.
+After a crash or DB failure between the grant and the confirmation, the next
+apply/resync/delete **reconciles** every pending row of the bundle against the
+workspace's effective grants:
+
+* if the privilege is effective, the row is **confirmed** (app-granted, so it
+  stays revocable);
+* if it isn't, the row is **dropped** and apply grants it again normally.
+
+Reconciled rows are reported in the response (`reconciled`), and the preview
+warns when pending rows exist. Reconciliation can't tell "our grant went
+through" apart from "someone else made the same grant in that window". It
+treats the privilege as ours, which errs on the side of never orphaning an
+app-made grant. While a row is pending, it counts as "still needed" for every
+other bundle.
+
 ### Safe revoke (resync / delete)
+
+Every decision about one grant runs under a **per-grant lock**: a Postgres
+`pg_advisory_xact_lock`, keyed on a stable 64-bit hash of (principal,
+securable type, full name, privilege). Within one transaction, the app
+re-reads the other bundles' rows, drops its own row, and revokes if it was the
+last user. Two bundles sharing a table, schema or catalog grant can therefore
+be deleted or resynced concurrently without both concluding "the other one
+still needs it" and orphaning the grant. Apply takes the same lock and
+re-checks presence under it. On non-Postgres databases (the SQLite used in
+tests), a process-local lock is used instead.
 
 To release one ledger row:
 
@@ -159,6 +217,21 @@ GRANT MANAGE ON CATALOG <catalog> TO `<app-service-principal-application-id>`;
   `meta.resourceType = "Group"` and workspace-local groups report
   `"WorkspaceGroup"` (confirmed live). Workspace-local groups are refused with
   a clear error, because Unity Catalog can't grant to them.
+* **Identity is the group id, not the name.** Before every preview, apply,
+  resync, delete and membership operation, the app looks up the stored SCIM
+  id:
+  * **Renamed** (same id, new name): UC grants follow the principal, so the
+    app updates the bundle's `group_name` and the ledger's `principal` to the
+    current name, then continues using that name.
+  * **No longer account-level**: the operation is blocked (400).
+  * **Deleted**: the bundle is **blocked**, even if a new group with the same
+    name exists. That is a different principal, and granting to or revoking
+    from it would act on someone else's access. The only allowed action is
+    `DELETE /api/genie-bundles/{id}?forget_orphaned=true` (the UI offers
+    "Forget orphaned bundle"). It is accepted only when a by-id lookup returns
+    *not found*. It drops the bundle and its ledger rows **without any
+    workspace call** and lists them in the response for audit. You can then
+    create a new bundle for the new group on that space.
 * Use a **dedicated** group per bundle, and don't map it to a persona. A
   persona Apply rewrites the Genie-space ACL of every group mapped to that
   persona. The preview warns if the group is persona-mapped.
@@ -225,9 +298,13 @@ the preview reports. The data model leaves room for a restriction step:
 
 * `genie_access_bundle.restriction_mode` (currently always `"none"`) is
   reserved for a later `"row_filter"` / `"abac"` mode.
-* A space can have **several bundles**, one per group, because uniqueness is
-  on (space, group). Each group can then be bound to a different restriction:
-  for example `genie-sales-emea` and `genie-sales-apac` on the same space.
+* A space has **one** bundle group (the "who can use this agent" group).
+  Different data per person comes from **additional** account groups
+  referenced by the filter or mask policy, for example `genie-sales-emea` and
+  `genie-sales-apac`, whose members are also in `genie-sales-users`. It does
+  not come from extra bundles. A later step can attach a list of such
+  restriction groups to the bundle without changing the one-group-per-space
+  rule.
 * The ledger already records securables by type and full name. Policy objects
   (functions, tag policies) can be added as new `securable_type` values and
   reuse the same safe-revoke rule.

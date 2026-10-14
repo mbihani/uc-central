@@ -175,6 +175,9 @@ function ActionResult({
           {(result.adopted ?? []).length} already present ·{" "}
           {(result.revoked ?? []).length} revoked ·{" "}
           {(result.released ?? []).length} released
+          {(result.reconciled ?? []).length > 0
+            ? ` · ${(result.reconciled ?? []).length} interrupted grant(s) reconciled`
+            : ""}
           {result.deleted ? " · bundle deleted" : ""}
         </div>
         {errors.length > 0 && (
@@ -306,7 +309,30 @@ function BundleRow({
   };
   const apply = useApplyGenieBundle({ mutation: handlers });
   const resync = useResyncGenieBundle({ mutation: handlers });
-  const remove = useDeleteGenieBundle({ mutation: handlers });
+  const remove = useDeleteGenieBundle({
+    mutation: {
+      onSuccess: handlers.onSuccess,
+      onError: (error: ApiError) => {
+        const detail = apiDetail(error);
+        // The group was deleted: offer the record-only escape hatch (the
+        // backend re-checks that the group id is really gone).
+        if (detail.includes("forget orphaned")) {
+          toast.error(detail, {
+            duration: 20000,
+            action: {
+              label: "Forget orphaned bundle",
+              onClick: () =>
+                remove.mutate({
+                  params: { bundle_id: bundle.id, forget_orphaned: true },
+                }),
+            },
+          });
+        } else {
+          toast.error(detail);
+        }
+      },
+    },
+  });
   const busy = apply.isPending || resync.isPending || remove.isPending;
 
   return (

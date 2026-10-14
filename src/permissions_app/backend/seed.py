@@ -17,7 +17,7 @@ time; the ON CONFLICT seeding here is the belt-and-suspenders that keeps the
 lazy per-request seed paths (``router._seed_*``) safe as well.
 """
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, inspect, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, SQLModel
 
@@ -26,6 +26,8 @@ from .logger import logger
 from .models import (
     DEFAULT_PERSONA_DESCRIPTIONS,
     DEFAULT_PERSONA_LABELS,
+    GENIE_BUNDLE_SPACE_UNIQUE,
+    LEDGER_CONFIRMED,
     DefaultPersona,
     GenieAccessBundle,
     GenieGrantLedger,
@@ -142,12 +144,20 @@ def ensure_unique_constraints(conn: Connection) -> None:
 
 
 def ensure_genie_bundle_schema(conn: Connection) -> None:
-    """Create the Genie access bundle + grant ledger tables IF missing.
+    """Create / upgrade the Genie access bundle + grant ledger tables.
 
-    Both tables are new (no pre-existing rows to de-duplicate), so
-    ``create_all(checkfirst=True)`` creates them together with their UNIQUE
-    constraints on a fresh or an existing database, and is a no-op on every
-    later run. Never alters or drops existing data.
+    Idempotent, on a fresh database AND on one created by the first version of
+    this feature (which allowed several bundles per space and had no ledger
+    ``state`` column). Never drops or rewrites data:
+
+      * ``create_all(checkfirst=True)`` creates missing tables (fresh DB: with
+        every column and index already in place).
+      * ``genie_grant_ledger.state`` is ADDed if missing; existing rows were all
+        written after their grant succeeded, so they default to ``confirmed``.
+      * the one-bundle-per-space UNIQUE index is created if missing. If the DB
+        already holds several bundles for one space the migration FAILS LOUDLY
+        (RuntimeError, aborting startup) naming them, rather than silently
+        deleting a bundle whose grants are recorded in the ledger.
     """
     SQLModel.metadata.create_all(
         conn,
@@ -157,6 +167,40 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
         ],
         checkfirst=True,
     )
+    insp = inspect(conn)
+    ledger = GenieGrantLedger.__tablename__
+    if "state" not in {c["name"] for c in insp.get_columns(ledger)}:
+        conn.execute(
+            text(
+                f"ALTER TABLE {ledger} ADD COLUMN state VARCHAR NOT NULL "
+                f"DEFAULT '{LEDGER_CONFIRMED}'"
+            )
+        )
+        logger.info(f"Added column {ledger}.state")
+
+    bundles = GenieAccessBundle.__tablename__
+    if GENIE_BUNDLE_SPACE_UNIQUE not in {i["name"] for i in insp.get_indexes(bundles)}:
+        dups = conn.execute(
+            text(
+                f"SELECT space_id, COUNT(*) FROM {bundles} "
+                f"GROUP BY space_id HAVING COUNT(*) > 1 ORDER BY space_id"
+            )
+        ).all()
+        if dups:
+            detail = "; ".join(f"space {d[0]}: {d[1]} bundles" for d in dups)
+            raise RuntimeError(
+                f"Cannot enforce one Genie access bundle per space: {detail}. "
+                f"Delete the extra bundle(s) through the app (DELETE "
+                f"/api/genie-bundles/<id>, which revokes their grants safely) on the "
+                f"previous version, then restart."
+            )
+        conn.execute(
+            text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {GENIE_BUNDLE_SPACE_UNIQUE} "
+                f"ON {bundles} (space_id)"
+            )
+        )
+        logger.info(f"Added UNIQUE index {GENIE_BUNDLE_SPACE_UNIQUE} on {bundles}(space_id)")
 
 
 def seed_defaults(conn: Connection) -> None:

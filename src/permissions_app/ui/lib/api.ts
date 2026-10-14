@@ -71,6 +71,7 @@ export interface GenieBundleActionOut {
   deleted?: boolean;
   errors?: string[];
   granted?: GenieGrantOut[];
+  reconciled?: GenieGrantOut[];
   released?: GenieGrantOut[];
   revoked?: GenieGrantOut[];
   status: string;
@@ -399,6 +400,7 @@ export interface CreateGenieBundleParams {
 
 export interface DeleteGenieBundleParams {
   bundle_id: number;
+  forget_orphaned?: boolean;
   "X-Forwarded-Access-Token"?: string | null;
 }
 
@@ -659,7 +661,11 @@ export function useCreateGenieBundle(options?: { mutation?: UseMutationOptions<{
 }
 
 export const deleteGenieBundle = async (params: DeleteGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
-  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  const searchParams = new URLSearchParams();
+  if (params?.forget_orphaned != null) searchParams.set("forget_orphaned", String(params?.forget_orphaned));
+  const queryString = searchParams.toString();
+  const url = queryString ? `/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}?${queryString}` : `/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}`;
+  const res = await fetch(url, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
     let parsed: unknown;
