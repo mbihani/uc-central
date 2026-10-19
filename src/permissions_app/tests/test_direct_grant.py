@@ -35,7 +35,7 @@ def _no_group_operation_locks():
     from contextlib import nullcontext
 
     with patch(
-        "permissions_app.backend.router.group_operation_locks",
+        "permissions_app.backend.router.operation_locks",
         side_effect=lambda *_a, **_k: nullcontext(),
     ):
         yield

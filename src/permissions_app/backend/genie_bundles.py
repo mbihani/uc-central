@@ -701,6 +701,24 @@ _HELD_LOCKS = "genie_grant_locks_held"
 _LOCK_CONN = "genie_grant_lock_conn"
 _HELD_OP_LOCKS = "persona_group_op_locks_held"
 
+# Operation-lock classes, in GLOBAL acquisition order. The complete lock order,
+# everywhere, is:
+#
+#     persona locks  ->  group locks  ->  per-grant locks
+#
+# each class in ascending key order. Persona delete: persona -> its groups ->
+# grants. Persona Apply: persona -> its groups -> grants. Mapping creation:
+# persona only. Mapping removal: group -> grants. Bundles: grants only.
+# Nothing ever waits for a lock of an EARLIER class (or a smaller key of the
+# same class) while holding one, so there is no deadlock; both rules are
+# enforced at runtime (RuntimeError).
+PERSONA_LOCK, GROUP_LOCK = 0, 1
+
+
+def persona_op_lock_key(persona: str) -> int:
+    raw = "\x1f".join(["persona-op", persona]).encode()
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
+
 
 def group_op_lock_key(group_id: str) -> int:
     """Advisory-lock key for persona OPERATIONS on one group (separate
@@ -710,39 +728,48 @@ def group_op_lock_key(group_id: str) -> int:
 
 
 @contextmanager
-def group_operation_locks(session: Session, group_ids: Iterable[str]) -> Iterator[None]:
-    """Serialize persona Apply / mapping removal / persona delete per GROUP.
+def operation_locks(
+    session: Session,
+    *,
+    personas: Iterable[str] = (),
+    group_ids: Iterable[str] = (),
+) -> Iterator[None]:
+    """Serialize persona operations, held across the whole block.
 
-    Held across the whole operation — mapping re-read, plan, workspace
-    writes, ledger verification and mapping deletion — so an Apply can never
-    act on a stale plan after a concurrent removal deleted the mapping (and
-    vice versa). Keyed on the group id, not (group, persona): Apply recreates
-    rows for EVERY persona of a group, so it must exclude every removal on
-    that group.
+    * PERSONA locks: persona delete (through its final commit), mapping
+      creation (which re-checks the persona exists under it) and persona Apply
+      — so no mapping can be created for a persona that is being deleted.
+    * GROUP locks: Apply, mapping removal, persona delete — held from the
+      mapping re-read through the plan, workspace writes, ledger verification
+      and mapping deletion, so Apply never acts on a stale plan after a
+      concurrent removal. Keyed on the group id, not (group, persona): Apply
+      recreates rows for EVERY persona of a group.
 
-    Lock ordering (deadlock freedom): all operation locks are taken ONCE, at
-    the start, in ascending key order, BEFORE any per-grant lock; nothing that
-    holds a grant lock ever waits for an operation lock (bundles take grant
-    locks only). Per-grant locks taken inside reuse this pooled connection, so
-    an operation still uses ONE connection. Postgres: session-level advisory
-    locks; other dialects: process-local locks with the same scope.
+    May be nested only in the global order above (e.g. a persona lock, then
+    group locks inside it); never inside a grant lock. Postgres: session-level
+    advisory locks on ONE pooled connection, which the ORM session and any
+    nested per-grant locks share. Other dialects: process-local locks.
     """
-    keys = sorted({group_op_lock_key(g) for g in group_ids if g})
-    if session.info.get(_HELD_LOCKS) or session.info.get(_HELD_OP_LOCKS):
-        raise RuntimeError(
-            "Group operation locks must be taken once, before any grant lock."
-        )
-    if not keys:
+    wanted = [(PERSONA_LOCK, k) for k in sorted({persona_op_lock_key(p) for p in personas if p})]
+    wanted += [(GROUP_LOCK, k) for k in sorted({group_op_lock_key(g) for g in group_ids if g})]
+    if session.info.get(_HELD_LOCKS):
+        raise RuntimeError("Operation locks must be taken before any grant lock.")
+    held: list[tuple[int, int]] = session.info.setdefault(_HELD_OP_LOCKS, [])
+    if not wanted:
         yield
         return
+    if held and wanted[0] <= max(held):
+        raise RuntimeError(
+            "Operation locks must follow the global order (persona -> group, ascending keys)."
+        )
     if session.in_transaction():
         session.commit()
-    session.info[_HELD_OP_LOCKS] = keys
+    held.extend(wanted)
     try:
         engine = session.get_bind().engine
         if engine.dialect.name != "postgresql":
             with _LOCAL_LOCKS_GUARD:
-                locks = [_LOCAL_LOCKS.setdefault(k, threading.Lock()) for k in keys]
+                locks = [_LOCAL_LOCKS.setdefault(k, threading.Lock()) for _, k in wanted]
             with ExitStack() as stack:
                 for lock in locks:
                     stack.enter_context(lock)
@@ -753,21 +780,23 @@ def group_operation_locks(session: Session, group_ids: Iterable[str]) -> Iterato
                         session.rollback()
             return
 
-        lock_conn = engine.connect()
-        session.info[_LOCK_CONN] = (lock_conn, session.bind)
+        owns_conn = _LOCK_CONN not in session.info
+        if owns_conn:
+            lock_conn = engine.connect()
+            session.info[_LOCK_CONN] = (lock_conn, session.bind)
+        else:
+            lock_conn = session.info[_LOCK_CONN][0]
         acquired: list[int] = []
         try:
-            for k in keys:
+            for _, k in wanted:
                 lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": k})
                 acquired.append(k)
             lock_conn.commit()
             session.bind = lock_conn  # ORM work shares the lock connection
             yield
         finally:
-            _, original_bind = session.info.pop(_LOCK_CONN)
             if session.in_transaction():
                 session.rollback()
-            session.bind = original_bind
             try:
                 if lock_conn.in_transaction():
                     lock_conn.rollback()
@@ -778,9 +807,12 @@ def group_operation_locks(session: Session, group_ids: Iterable[str]) -> Iterato
                 lock_conn.invalidate()
                 raise
             finally:
-                lock_conn.close()
+                if owns_conn:
+                    _, original_bind = session.info.pop(_LOCK_CONN)
+                    session.bind = original_bind
+                    lock_conn.close()
     finally:
-        session.info.pop(_HELD_OP_LOCKS, None)
+        del held[len(held) - len(wanted):]
 
 
 @contextmanager

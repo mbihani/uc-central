@@ -886,3 +886,79 @@ def test_concurrent_apply_remove_and_bundle_ops_do_not_deadlock_postgres(ws, mon
         assert not ws.has("table", ORDERS, "SELECT", principal=HR_GROUP)
     SQLModel.metadata.drop_all(engine)
     engine.dispose()
+
+
+# ═══ Review round 4: persona delete vs. mapping creation ═══
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_mapping_creation_cannot_race_persona_delete_postgres(ws, monkeypatch):
+    """Persona delete is paused AFTER its group cleanup and final mapping check,
+    right before deleting the persona. A concurrent mapping creation for that
+    persona must wait on the persona lock and then be refused — never leave a
+    mapping pointing at a deleted persona."""
+    import threading
+
+    from permissions_app.backend import router
+
+    engine = create_engine(PG_URL or "")
+    _pg_setup(engine)
+    with Session(engine) as s:
+        apply_permissions("sales_analyst", ws, s, None, "admin")
+    paused, go = threading.Event(), threading.Event()
+
+    def pause():
+        paused.set()
+        assert go.wait(20)
+
+    monkeypatch.setattr(router, "_before_persona_delete_commit", pause)
+    results: dict = {}
+    errors: list[str] = []
+
+    def run(name, fn):
+        try:
+            with Session(engine) as s:
+                results[name] = fn(s)
+        except HTTPException as e:
+            results[name] = e
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t_del = threading.Thread(target=run, args=("delete", lambda s: delete_persona("sales_analyst", ws, s, "admin")))
+    t_del.start()
+    assert paused.wait(20)
+    # g-1 was already processed by the delete (its lock released): create again.
+    body = PersonaGroupMappingIn(group_id="g-1", group_name=GROUP, persona="sales_analyst")
+    t_create = threading.Thread(target=run, args=("create", lambda s: create_persona_mapping(body, s)))
+    t_create.start()
+    t_create.join(1.0)
+    assert t_create.is_alive(), "mapping creation did not wait for the persona delete"
+    go.set()
+    t_del.join(30)
+    t_create.join(30)
+
+    assert errors == [], errors
+    assert results["delete"]["persona_deleted"] is True
+    assert isinstance(results["create"], HTTPException) and results["create"].status_code == 400
+    with Session(engine) as s:
+        orphans = s.exec(select(PersonaGroupMapping).where(PersonaGroupMapping.persona == "sales_analyst")).all()
+        assert orphans == []  # no mapping points at the deleted persona
+        assert s.exec(select(PersonaDefinition).where(PersonaDefinition.key == "sales_analyst")).first() is None
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def test_operation_lock_order_is_enforced(session):
+    from permissions_app.backend import genie_bundles as gb
+
+    with gb.operation_locks(session, personas=["p"]):
+        with gb.operation_locks(session, group_ids=["g-1"]):  # persona -> group: OK
+            with gb._grant_lock(session, "g-1", gb.GrantKey("table", ORDERS, "SELECT")):
+                with pytest.raises(RuntimeError, match="before any grant lock"):
+                    with gb.operation_locks(session, group_ids=["g-2"]):
+                        pass
+    with gb.operation_locks(session, group_ids=["g-1"]):
+        with pytest.raises(RuntimeError, match="global order"):  # group -> persona: refused
+            with gb.operation_locks(session, personas=["p"]):
+                pass
+    assert session.info[gb._HELD_OP_LOCKS] == []

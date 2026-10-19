@@ -74,7 +74,7 @@ from .models import (
     get_permission_rank,
     is_permission_level_allowed,
 )
-from .genie_bundles import PERSONA_SOURCE_PREFIX, group_operation_locks
+from .genie_bundles import PERSONA_SOURCE_PREFIX, operation_locks
 from .persona_sync import (
     GENIE,
     NONE,
@@ -709,10 +709,9 @@ def delete_persona(
     fails, that mapping AND the persona (templates, overrides, user mappings)
     are kept and the errors are returned, so the delete can simply be retried.
     """
-    defn = session.exec(
+    if not session.exec(
         select(PersonaDefinition).where(PersonaDefinition.key == persona_key)
-    ).first()
-    if not defn:
+    ).first():
         raise HTTPException(status_code=404, detail="Persona not found")
 
     def mapped():
@@ -720,59 +719,54 @@ def delete_persona(
             select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona_key)
         ).all()
 
-    # Serialized with Apply / removal on the same groups; mappings re-read
-    # under the lock. A group mapped after the first read is not locked: the
-    # delete then refuses (below) rather than leaving that mapping behind.
-    gids = {m.group_id for m in mapped()}
-    with group_operation_locks(session, gids):
-        mappings = [m for m in mapped() if m.group_id in gids]
-        refs = resolve_groups(obo_ws, mappings)
-        resynced = [
-            _remove_group_persona(obo_ws, session, m, refs[m.group_id], actor) for m in mappings
-        ]
-    if any(m.group_id not in gids for m in mapped()):
-        return {
-            "status": "incomplete",
-            "persona_deleted": False,
-            "message": (
-                f"Persona '{persona_key}' was NOT deleted: a group was mapped to it "
-                f"while it was being deleted. Retry."
-            ),
-            "groups_recomputed": [r.model_dump() for r in resynced],
-        }
-    if not all(r.mapping_removed for r in resynced):
-        return {
-            "status": "incomplete",
-            "persona_deleted": False,
-            "message": (
-                f"Persona '{persona_key}' was NOT deleted: cleanup failed for "
-                f"{sum(not r.mapping_removed for r in resynced)} group(s); their mappings "
-                f"were kept. Fix the errors and retry."
-            ),
-            "groups_recomputed": [r.model_dump() for r in resynced],
-        }
+    # Lock order: persona -> its groups -> grants (see operation_locks). The
+    # PERSONA lock is held through the final commit, and mapping creation takes
+    # it too, so no mapping can appear for this persona once it is checked.
+    with operation_locks(session, personas=[persona_key]):
+        defn = session.exec(
+            select(PersonaDefinition)
+            .where(PersonaDefinition.key == persona_key)
+            .execution_options(populate_existing=True)
+        ).first()
+        if not defn:
+            raise HTTPException(status_code=404, detail="Persona not found")
+        gids = {m.group_id for m in mapped()}
+        with operation_locks(session, group_ids=gids):
+            mappings = [m for m in mapped() if m.group_id in gids]
+            refs = resolve_groups(obo_ws, mappings)
+            resynced = [
+                _remove_group_persona(obo_ws, session, m, refs[m.group_id], actor)
+                for m in mappings
+            ]
+        if not all(r.mapping_removed for r in resynced) or mapped():
+            # A failed cleanup keeps its mapping; ``mapped()`` is also a
+            # belt-and-braces check (creation is excluded by the persona lock).
+            return {
+                "status": "incomplete",
+                "persona_deleted": False,
+                "message": (
+                    f"Persona '{persona_key}' was NOT deleted: cleanup failed for "
+                    f"{sum(not r.mapping_removed for r in resynced)} group(s); their "
+                    f"mappings were kept. Fix the errors and retry."
+                ),
+                "groups_recomputed": [r.model_dump() for r in resynced],
+            }
 
-    # Delete associated user mappings
-    user_maps = session.exec(
-        select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
-    ).all()
-    for um in user_maps:
-        session.delete(um)
-
-    # Delete associated permission templates
-    templates = session.exec(
-        select(PermissionTemplate).where(PermissionTemplate.persona == persona_key)
-    ).all()
-    for t in templates:
-        session.delete(t)
-
-    for o in session.exec(
-        select(PersonaResourceOverride).where(PersonaResourceOverride.persona == persona_key)
-    ).all():
-        session.delete(o)
-
-    session.delete(defn)
-    session.commit()
+        _before_persona_delete_commit()
+        for um in session.exec(
+            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
+        ).all():
+            session.delete(um)
+        for t in session.exec(
+            select(PermissionTemplate).where(PermissionTemplate.persona == persona_key)
+        ).all():
+            session.delete(t)
+        for o in session.exec(
+            select(PersonaResourceOverride).where(PersonaResourceOverride.persona == persona_key)
+        ).all():
+            session.delete(o)
+        session.delete(defn)
+        session.commit()
 
     return {
         "status": "ok",
@@ -780,6 +774,11 @@ def delete_persona(
         "message": f"Persona '{persona_key}' deleted",
         "groups_recomputed": [r.model_dump() for r in resynced],
     }
+
+
+def _before_persona_delete_commit() -> None:
+    """No-op seam: persona delete has verified that no mapping is left and is
+    about to delete the persona (tests pause here)."""
 
 
 @api.post(
@@ -792,45 +791,51 @@ def create_persona_mapping(
     session: SessionDep,
     _admin: AdminRequired = True,
 ):
-    """Map a Databricks group to a persona."""
-    # Validate persona exists
-    persona_def = session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == body.persona)
-    ).first()
-    if not persona_def:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Persona '{body.persona}' does not exist.",
-        )
+    """Map a Databricks group to a persona.
 
-    # Personas stack: a group may map to several personas, each once.
-    existing = session.exec(
-        select(PersonaGroupMapping).where(
-            PersonaGroupMapping.group_id == body.group_id,
-            PersonaGroupMapping.persona == body.persona,
-        )
-    ).first()
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Group {body.group_name} is already mapped to persona {existing.persona}",
-        )
+    Runs under the PERSONA lock (shared with persona delete) and re-checks the
+    persona under it, so a mapping can never be created for a persona whose
+    deletion is in progress or done.
+    """
+    with operation_locks(session, personas=[body.persona]):
+        persona_def = session.exec(
+            select(PersonaDefinition)
+            .where(PersonaDefinition.key == body.persona)
+            .execution_options(populate_existing=True)
+        ).first()
+        if not persona_def:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Persona '{body.persona}' does not exist.",
+            )
 
-    mapping = PersonaGroupMapping(
-        group_id=body.group_id,
-        group_name=body.group_name,
-        persona=body.persona,
-    )
-    session.add(mapping)
-    session.commit()
-    session.refresh(mapping)
+        # Personas stack: a group may map to several personas, each once.
+        existing = session.exec(
+            select(PersonaGroupMapping).where(
+                PersonaGroupMapping.group_id == body.group_id,
+                PersonaGroupMapping.persona == body.persona,
+            )
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Group {body.group_name} is already mapped to persona {existing.persona}",
+            )
 
-    return PersonaGroupMappingOut(
-        id=mapping.id,  # type: ignore
-        group_id=mapping.group_id,
-        group_name=mapping.group_name,
-        persona=mapping.persona,
-    )
+        mapping = PersonaGroupMapping(
+            group_id=body.group_id,
+            group_name=body.group_name,
+            persona=body.persona,
+        )
+        session.add(mapping)
+        session.commit()
+        session.refresh(mapping)
+        return PersonaGroupMappingOut(
+            id=mapping.id,  # type: ignore
+            group_id=mapping.group_id,
+            group_name=mapping.group_name,
+            persona=mapping.persona,
+        )
 
 
 @api.delete(
@@ -857,7 +862,7 @@ def delete_persona_mapping(
     mapping = session.get(PersonaGroupMapping, mapping_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="Mapping not found")
-    with group_operation_locks(session, [mapping.group_id]):
+    with operation_locks(session, group_ids=[mapping.group_id]):
         # Re-read under the lock (a concurrent removal may have finished).
         mapping = session.get(PersonaGroupMapping, mapping_id, populate_existing=True)
         if not mapping:
@@ -1993,12 +1998,19 @@ def apply_permissions(
         templates = [t for t in templates if t.resource_type in requested_set]
 
     # Serialize with mapping removal / persona delete on the same groups (see
-    # genie_bundles.group_operation_locks). Mappings are RE-READ under the lock:
+    # genie_bundles.operation_locks; order persona -> groups -> grants). The
+    # persona is re-checked and mappings are RE-READ under the lock:
     # a removal that finished while we waited deleted its mapping, so that group
     # is skipped instead of being re-granted from a stale read. A group mapped
     # only after the first read is not locked and therefore not applied now.
     gids = {m.group_id for m in mappings}
-    with group_operation_locks(session, gids):
+    with operation_locks(session, personas=[persona], group_ids=gids):
+        if not session.exec(
+            select(PersonaDefinition)
+            .where(PersonaDefinition.key == persona)
+            .execution_options(populate_existing=True)
+        ).first():
+            raise HTTPException(status_code=404, detail=f"Persona '{persona}' not found")
         mappings = [
             m
             for m in session.exec(

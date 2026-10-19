@@ -388,16 +388,29 @@ entry is **removed**, including entries an admin set by hand for that group on
 the Resources page. The removal preview says so. Re-add such an entry after the
 removal if it is still wanted (or give it to the group through a persona).
 
-**Concurrency.** Apply, mapping removal and persona delete take a per-**group**
-operation lock (Postgres advisory lock keyed on the group id; process-local
-locks elsewhere). It is held from the mapping read through the plan, the
-workspace writes and the ledger check, to the mapping deletion. Apply reads the
-mappings, takes the locks, and re-reads them under the lock, so a removal that
-finished meanwhile makes Apply skip that group instead of re-granting it from a
-stale plan. Lock order: all operation locks first (ascending, taken once),
-then per-grant locks inside. Nothing holding a grant lock waits for an
-operation lock, and bundle operations take grant locks only, so there is no
-deadlock. The per-grant locks reuse the operation's pooled connection.
+**Concurrency.** Persona operations take advisory locks (Postgres;
+process-local locks elsewhere) in **one global order**:
+
+    persona locks  ->  group locks  ->  per-grant locks   (each class ascending)
+
+| Operation | Locks, in order |
+|---|---|
+| Persona delete | persona → each mapped group → grants |
+| Persona Apply | persona → its mapped groups → grants |
+| Create a mapping | persona |
+| Remove a mapping | group → grants |
+| Bundle apply / resync / delete | grants only |
+
+Group locks are held from the mapping read through the plan, the workspace
+writes and the ledger check, to the mapping deletion. Apply reads the mappings,
+takes the locks, then re-checks the persona and re-reads the mappings under
+them, so a removal that finished meanwhile makes Apply skip that group instead
+of re-granting from a stale plan. Persona delete holds its persona lock
+through the final commit. Mapping creation takes the same lock and re-checks
+that the persona exists, so no mapping can ever point at a deleted persona.
+Nothing holding a lock waits for one of an earlier class or a smaller key, so
+there is no deadlock. Both rules are enforced at runtime. All locks of one
+operation share its single pooled connection.
 
 **When removal is refused (mapping kept, retry later):**
 * any ACL write or UC revoke failed, or a ledger row of the persona is left;
