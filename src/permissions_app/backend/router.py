@@ -691,8 +691,20 @@ def update_persona(persona_key: str, body: PersonaDefinitionUpdateIn, session: S
     response_model=dict,
     operation_id="deletePersona",
 )
-def delete_persona(persona_key: str, session: SessionDep, _admin: AdminRequired = True):
-    """Delete a persona and all its associated mappings and permission templates."""
+def delete_persona(
+    persona_key: str,
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    session: SessionDep,
+    actor: ActorDep = "",
+    _admin: AdminRequired = True,
+):
+    """Delete a persona and all its associated mappings and permission templates.
+
+    Every group the persona was mapped to is then RECOMPUTED from its remaining
+    personas (exactly like removing the mapping): its entries on the types this
+    persona granted are set to what is left, and table grants the persona
+    sourced are released (revoked only if app-made and nothing else needs them).
+    """
     defn = session.exec(
         select(PersonaDefinition).where(PersonaDefinition.key == persona_key)
     ).first()
@@ -703,6 +715,8 @@ def delete_persona(persona_key: str, session: SessionDep, _admin: AdminRequired 
     mappings = session.exec(
         select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona_key)
     ).all()
+    affected = _types_granted_by(session, persona_key)
+    group_refs = resolve_groups(obo_ws, mappings) if affected else {}
     for m in mappings:
         session.delete(m)
 
@@ -725,13 +739,18 @@ def delete_persona(persona_key: str, session: SessionDep, _admin: AdminRequired 
     ).all():
         session.delete(o)
 
-    # NOTE: no workspace writes here (unchanged behaviour). Table grants this
-    # persona sourced stay in the ledger and are released by the next persona
-    # Apply / removal for those groups, since the persona no longer maps them.
     session.delete(defn)
     session.commit()
 
-    return {"status": "ok", "message": f"Persona '{persona_key}' deleted"}
+    resynced = [
+        _resync_group(obo_ws, session, ref, persona_key, affected, actor)
+        for ref in group_refs.values()
+    ]
+    return {
+        "status": "ok",
+        "message": f"Persona '{persona_key}' deleted",
+        "groups_recomputed": [r.model_dump() for r in resynced],
+    }
 
 
 @api.post(
@@ -787,7 +806,7 @@ def create_persona_mapping(
 
 @api.delete(
     "/personas/mappings/{mapping_id}",
-    response_model=dict,
+    response_model=GroupResyncOut,
     operation_id="deletePersonaMapping",
 )
 def delete_persona_mapping(
@@ -814,7 +833,20 @@ def delete_persona_mapping(
     group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
     session.delete(mapping)
     session.commit()
+    return _resync_group(obo_ws, session, group_ref, removed, affected, actor)
 
+
+def _resync_group(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    group_ref: GroupRef,
+    removed: str,
+    affected: list[str],
+    actor: str,
+) -> GroupResyncOut:
+    """After ``removed`` stopped applying to a group: rewrite the group's entry
+    on every resource of the ``affected`` types to what its REMAINING personas
+    (and applied bundles) grant, and release table grants nothing needs."""
     out = GroupResyncOut(
         group_id=group_ref.group_id, group_name=group_ref.name, removed_persona=removed
     )
@@ -1832,7 +1864,7 @@ def apply_permissions(
         )
 
     # Optional per-resource-TYPE scoping. When the caller provides resource_types,
-    # apply ONLY those types (still each group at THIS persona's own level);
+    # apply ONLY those types (each group still at its effective, stacked level);
     # None/omitted => all template types (original behaviour). Requested types are
     # validated against the persona's own template so an unknown/mistyped type is a
     # clear 400 rather than a silent no-op.
@@ -1879,8 +1911,8 @@ def apply_permissions(
     total_errors = 0
 
     for template in templates:
-        # Apply THIS persona's own matrix level for the resource type — never a
-        # cross-persona max. (Multi-group users are unioned by Databricks itself.)
+        # THIS persona's cell decides only whether the type is valid / supported;
+        # the level written per group is its effective (stacked) level below.
         level = template.permission_level
 
         # Resource types advertised in the matrix but that the app cannot
