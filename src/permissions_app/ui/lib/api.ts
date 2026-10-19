@@ -9,8 +9,12 @@ export interface ApplyAllResultOut {
   direct_users_synced?: number;
   persona: string;
   results: ApplyResultOut[];
+  table_grant_errors?: string[];
+  table_grants_added?: number;
+  table_grants_revoked?: number;
   total_errors: number;
   total_resources_updated: number;
+  warnings?: string[];
 }
 
 export interface ApplyPermissionsIn {
@@ -33,12 +37,16 @@ export interface ApplyPlanSkippedOut {
 
 export interface ApplyPreviewOut {
   direct_user_count?: number;
+  escalation_count?: number;
   group_count: number;
+  group_levels?: GroupLevelOut[];
   groups: string[];
   persona: string;
   plan: ApplyPlanItemOut[];
   skipped: ApplyPlanSkippedOut[];
+  table_grants?: TableGrantPlanOut[];
   total_resources_affected: number;
+  warnings?: string[];
 }
 
 export interface ApplyResultOut {
@@ -141,6 +149,21 @@ export interface GenieSpaceObjectOut {
   table_type?: string | null;
 }
 
+export interface GroupLevelOut {
+  blocked?: string | null;
+  effective_level: string;
+  escalation?: boolean;
+  escalation_detail?: string | null;
+  granted_by?: string[];
+  group_id: string;
+  group_name: string;
+  resource_id?: string | null;
+  resource_name?: string | null;
+  resource_type: string;
+  resource_type_label: string;
+  source_levels?: Record<string, string>;
+}
+
 export interface GroupMemberOut {
   display_name?: string | null;
   user_id: string;
@@ -152,6 +175,26 @@ export interface GroupOut {
   id: string;
   member_count?: number;
   members?: GroupMemberOut[];
+}
+
+export interface GroupResyncOut {
+  errors?: string[];
+  group_id: string;
+  group_name: string;
+  removed_persona: string;
+  resources_updated?: number;
+  table_grants_added?: number;
+  table_grants_revoked?: number;
+  warnings?: string[];
+}
+
+export interface GroupResyncPreviewOut {
+  group_id: string;
+  group_levels?: GroupLevelOut[];
+  group_name: string;
+  removed_persona: string;
+  table_grants?: TableGrantPlanOut[];
+  warnings?: string[];
 }
 
 export interface HTTPValidationError {
@@ -213,10 +256,27 @@ export interface PermissionMatrixCell {
 export interface PermissionMatrixOut {
   allowed_permission_levels: Record<string, string[]>;
   matrix: PermissionTemplateOut[];
+  overridable_resource_types?: string[];
+  overrides?: PermissionOverrideOut[];
   persona_labels: Record<string, string>;
   personas: string[];
   resource_type_labels: Record<string, string>;
   resource_types: string[];
+}
+
+export interface PermissionOverrideIn {
+  permission_level?: PermissionLevel | null;
+  persona: string;
+  resource_id: string;
+  resource_type: ResourceType;
+}
+
+export interface PermissionOverrideOut {
+  id: number;
+  permission_level: string;
+  persona: string;
+  resource_id: string;
+  resource_type: string;
 }
 
 export interface PermissionTemplateOut {
@@ -327,6 +387,21 @@ export type ResourceType = (typeof ResourceType)[keyof typeof ResourceType];
 export interface SetPermissionIn {
   group_name: string;
   permission_level: PermissionLevel;
+}
+
+export interface TableGrantPlanOut {
+  action: string;
+  detail?: string | null;
+  full_name: string;
+  group_id: string;
+  group_name: string;
+  has_row_filter?: boolean;
+  masked_columns?: string[];
+  privilege: string;
+  securable_type: string;
+  source: string;
+  space_id: string;
+  space_title?: string;
 }
 
 export interface User {
@@ -472,6 +547,10 @@ export interface UpdatePermissionMatrixParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface SetPermissionOverrideParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface ListPersonasParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -485,6 +564,11 @@ export interface CreatePersonaMappingParams {
 }
 
 export interface DeletePersonaMappingParams {
+  mapping_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface PreviewPersonaMappingRemovalParams {
   mapping_id: number;
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -946,6 +1030,21 @@ export function useUpdatePermissionMatrix(options?: { mutation?: UseMutationOpti
   return useMutation({ mutationFn: (vars) => updatePermissionMatrix(vars.data, vars.params), ...options?.mutation });
 }
 
+export const setPermissionOverride = async (data: PermissionOverrideIn, params?: SetPermissionOverrideParams, options?: RequestInit): Promise<{ data: PermissionOverrideOut[] }> => {
+  const res = await fetch("/api/permissions/matrix/overrides", { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useSetPermissionOverride(options?: { mutation?: UseMutationOptions<{ data: PermissionOverrideOut[] }, ApiError, { params: SetPermissionOverrideParams; data: PermissionOverrideIn }> }) {
+  return useMutation({ mutationFn: (vars) => setPermissionOverride(vars.data, vars.params), ...options?.mutation });
+}
+
 export const listPersonas = async (params?: ListPersonasParams, options?: RequestInit): Promise<{ data: PersonaOut[] }> => {
   const res = await fetch("/api/personas", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
@@ -999,7 +1098,7 @@ export function useCreatePersonaMapping(options?: { mutation?: UseMutationOption
   return useMutation({ mutationFn: (vars) => createPersonaMapping(vars.data, vars.params), ...options?.mutation });
 }
 
-export const deletePersonaMapping = async (params: DeletePersonaMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+export const deletePersonaMapping = async (params: DeletePersonaMappingParams, options?: RequestInit): Promise<{ data: GroupResyncOut }> => {
   const res = await fetch(`/api/personas/mappings/${encodeURIComponent(String(params.mapping_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
@@ -1010,8 +1109,31 @@ export const deletePersonaMapping = async (params: DeletePersonaMappingParams, o
   return { data: await res.json() };
 };
 
-export function useDeletePersonaMapping(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: DeletePersonaMappingParams }> }) {
+export function useDeletePersonaMapping(options?: { mutation?: UseMutationOptions<{ data: GroupResyncOut }, ApiError, { params: DeletePersonaMappingParams }> }) {
   return useMutation({ mutationFn: (vars) => deletePersonaMapping(vars.params), ...options?.mutation });
+}
+
+export const previewPersonaMappingRemoval = async (params: PreviewPersonaMappingRemovalParams, options?: RequestInit): Promise<{ data: GroupResyncPreviewOut }> => {
+  const res = await fetch(`/api/personas/mappings/${encodeURIComponent(String(params.mapping_id))}/removal-preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const previewPersonaMappingRemovalKey = (params?: PreviewPersonaMappingRemovalParams) => {
+  return ["/api/personas/mappings/{mapping_id}/removal-preview", params] as const;
+};
+
+export function usePreviewPersonaMappingRemoval<TData = { data: GroupResyncPreviewOut }>(options: { params: PreviewPersonaMappingRemovalParams; query?: Omit<UseQueryOptions<{ data: GroupResyncPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: previewPersonaMappingRemovalKey(options.params), queryFn: () => previewPersonaMappingRemoval(options.params), ...options?.query });
+}
+
+export function usePreviewPersonaMappingRemovalSuspense<TData = { data: GroupResyncPreviewOut }>(options: { params: PreviewPersonaMappingRemovalParams; query?: Omit<UseSuspenseQueryOptions<{ data: GroupResyncPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: previewPersonaMappingRemovalKey(options.params), queryFn: () => previewPersonaMappingRemoval(options.params), ...options?.query });
 }
 
 export const createPersonaUserMapping = async (data: PersonaUserMappingIn, params?: CreatePersonaUserMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {

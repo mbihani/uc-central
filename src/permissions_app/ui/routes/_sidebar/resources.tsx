@@ -7,6 +7,7 @@ import {
   useGetResourcePermissions,
   useSetResourcePermissions,
   useListGroupsSuspense,
+  useListPersonas,
   getResourcePermissionsKey,
   ResourceType,
   PermissionLevel,
@@ -330,6 +331,15 @@ function ResourcePermissionDialog({
   const { data: groups } = useListGroupsSuspense(selector());
   const queryClient = useQueryClient();
   const { isAdmin } = useAdmin();
+  const isGenie = resource.resource_type === "genie";
+  // Genie only: which groups' access is owned by persona Apply.
+  const personasQuery = useListPersonas({ query: { enabled: isGenie && open } });
+  const personaGroups = new Map<string, string[]>();
+  for (const p of personasQuery.data?.data ?? []) {
+    for (const g of p.groups) {
+      personaGroups.set(g.group_name, [...(personaGroups.get(g.group_name) ?? []), p.label]);
+    }
+  }
 
   const permissionsQuery = useGetResourcePermissions({
     params: {
@@ -429,6 +439,27 @@ function ResourcePermissionDialog({
         </DialogHeader>
 
         <div className="space-y-4">
+          {isGenie && (
+            <div className="flex gap-2 rounded-md border border-amber-500/50 bg-amber-500/5 p-3 text-xs">
+              <AlertCircle className="h-4 w-4 shrink-0 text-amber-600" />
+              <div className="space-y-1">
+                <p className="font-medium text-amber-700 dark:text-amber-400">
+                  Space access only — no table grants
+                </p>
+                <p className="text-muted-foreground">
+                  Changes here set this Genie space's ACL and nothing else: no
+                  Unity Catalog SELECT / USE grants are added or removed, so a
+                  group given access here may not be able to query the space's
+                  tables. For groups mapped to personas, the persona Apply on
+                  the Permissions page decides their access (including table
+                  grants) and will overwrite an edit made here.
+                  {personaGroups.size > 0 && (
+                    <> Persona-managed groups: {[...personaGroups.keys()].sort().join(", ")}.</>
+                  )}
+                </p>
+              </div>
+            </div>
+          )}
           {permissionsQuery.isLoading ? (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="h-6 w-6 animate-spin" />
@@ -523,6 +554,11 @@ function ResourcePermissionDialog({
                             <TableRow key={group.id}>
                               <TableCell className="font-medium text-sm">
                                 {group.display_name}
+                                {isGenie && personaGroups.has(group.display_name) && (
+                                  <Badge variant="outline" className="ml-2 text-[10px]" title="Persona Apply decides this group's Genie access">
+                                    persona: {personaGroups.get(group.display_name)?.join(", ")}
+                                  </Badge>
+                                )}
                               </TableCell>
                               <TableCell>
                                 <Select

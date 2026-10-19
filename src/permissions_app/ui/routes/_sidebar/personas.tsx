@@ -8,6 +8,7 @@ import {
   useListUsersSuspense,
   useCreatePersonaMapping,
   useDeletePersonaMapping,
+  usePreviewPersonaMappingRemoval,
   useCreatePersonaUserMapping,
   useRemovePersonaMember,
   useCreatePersona,
@@ -104,11 +105,15 @@ function PersonasContent() {
   const [createOpen, setCreateOpen] = useState(false);
   const { isAdmin } = useAdmin();
 
-  // Get list of already-mapped group IDs
-  const mappedGroupIds = new Set(
-    personas.flatMap((p) => p.groups.map((g) => g.group_id)),
-  );
-  const availableGroups = groups.filter((g) => !mappedGroupIds.has(g.id));
+  // Personas STACK: a group may map to several personas (its level on each
+  // object is the highest any of them grants). Track which personas each group
+  // already holds so a persona only offers groups it does not map yet.
+  const groupPersonas = new Map<string, string[]>();
+  for (const p of personas) {
+    for (const g of p.groups) {
+      groupPersonas.set(g.group_id, [...(groupPersonas.get(g.group_id) ?? []), p.label]);
+    }
+  }
 
   // Get list of already-mapped user IDs (direct persona-user mappings)
   const mappedUserIds = new Set(
@@ -149,7 +154,10 @@ function PersonasContent() {
           <PersonaCard
             key={persona.persona}
             persona={persona}
-            availableGroups={availableGroups}
+            availableGroups={groups.filter(
+              (g) => !persona.groups.some((m) => m.group_id === g.id),
+            )}
+            groupPersonas={groupPersonas}
             availableUsers={availableUsers}
             onChanged={invalidateAll}
             isAdmin={isAdmin}
@@ -171,12 +179,14 @@ function PersonasContent() {
 function PersonaCard({
   persona,
   availableGroups,
+  groupPersonas,
   availableUsers,
   onChanged,
   isAdmin,
 }: {
   persona: PersonaOut;
   availableGroups: { id: string; display_name: string }[];
+  groupPersonas: Map<string, string[]>;
   availableUsers: UserOut[];
   onChanged: () => void;
   isAdmin: boolean;
@@ -249,6 +259,10 @@ function PersonaCard({
                     key={g.id}
                     mappingId={g.id}
                     groupName={g.group_name}
+                    personaLabel={persona.label}
+                    otherPersonas={(groupPersonas.get(g.group_id) ?? []).filter(
+                      (l) => l !== persona.label,
+                    )}
                     onDeleted={onChanged}
                     isAdmin={isAdmin}
                   />
@@ -290,6 +304,7 @@ function PersonaCard({
               persona={persona.persona}
               personaLabel={persona.label}
               availableGroups={availableGroups}
+              groupPersonas={groupPersonas}
               onCreated={onChanged}
             />
             <AddUserDialog
@@ -326,42 +341,152 @@ function PersonaCard({
 function GroupMappingBadge({
   mappingId,
   groupName,
+  personaLabel,
+  otherPersonas,
   onDeleted,
   isAdmin,
 }: {
   mappingId: number;
   groupName: string;
+  personaLabel: string;
+  otherPersonas: string[];
   onDeleted: () => void;
   isAdmin: boolean;
 }) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  // Read-only: what removing this persona from the group would change.
+  const preview = usePreviewPersonaMappingRemoval({
+    params: { mapping_id: mappingId },
+    query: { enabled: confirmOpen, staleTime: 0, gcTime: 0 },
+  });
   const deleteMapping = useDeletePersonaMapping({
     mutation: {
-      onSuccess: () => {
-        toast.success(`Removed ${groupName} from persona`);
+      onSuccess: ({ data }) => {
+        const errors = data.errors ?? [];
+        const revoked = data.table_grants_revoked ?? 0;
+        const summary = `Removed ${personaLabel} from ${groupName}; recomputed ${data.resources_updated ?? 0} resource(s)` +
+          (revoked ? `, revoked ${revoked} table grant(s)` : "");
+        if (errors.length) {
+          toast.warning(`${summary} — ${errors.length} error(s): ${errors[0]}`);
+        } else {
+          toast.success(summary);
+        }
+        setConfirmOpen(false);
         onDeleted();
       },
       onError: (error) => {
-        toast.error(`Failed to remove mapping: ${error.message}`);
+        toast.error(`Failed to remove mapping: ${apiDetail(error)}`);
       },
     },
   });
 
+  const levels = preview.data?.data.group_levels ?? [];
+  const grants = (preview.data?.data.table_grants ?? []).filter(
+    (g) => g.action === "revoke" || g.action === "release",
+  );
+  const warnings = preview.data?.data.warnings ?? [];
+
   return (
     <div className="flex items-center justify-between gap-2 p-2 rounded-md border bg-muted/30">
-      <span className="text-sm truncate">{groupName}</span>
+      <span className="text-sm truncate">
+        {groupName}
+        {otherPersonas.length > 0 && (
+          <span className="text-xs text-muted-foreground">
+            {" "}
+            · also {otherPersonas.join(", ")}
+          </span>
+        )}
+      </span>
       {isAdmin && (
         <Button
           variant="ghost"
           size="icon"
           className="h-6 w-6 text-muted-foreground hover:text-destructive"
           disabled={deleteMapping.isPending}
-          onClick={() => {
-            deleteMapping.mutate({ params: { mapping_id: mappingId } });
-          }}
+          onClick={() => setConfirmOpen(true)}
+          title="Remove this persona from the group"
         >
           <Trash2 className="h-3 w-3" />
         </Button>
       )}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent className="max-w-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Remove {personaLabel} from {groupName}?
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3 text-sm">
+                <p>
+                  The group's access is recomputed from its remaining personas
+                  {otherPersonas.length > 0 ? ` (${otherPersonas.join(", ")})` : ""}{" "}
+                  and Genie access bundles. Only what nothing else grants is
+                  removed; table grants are revoked only if the app created them
+                  and no other persona or bundle still needs them.
+                </p>
+                {preview.isLoading && <Skeleton className="h-16 w-full" />}
+                {preview.isError && (
+                  <p className="text-destructive">
+                    Could not load the preview: {apiDetail(preview.error)}
+                  </p>
+                )}
+                {levels.length > 0 && (
+                  <div className="max-h-48 overflow-auto rounded border">
+                    <table className="w-full text-xs">
+                      <thead className="bg-muted/50 text-left">
+                        <tr>
+                          <th className="p-1.5">Object</th>
+                          <th className="p-1.5">Level after removal</th>
+                          <th className="p-1.5">From</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {levels.map((l) => (
+                          <tr key={`${l.resource_type}:${l.resource_id ?? "*"}`} className="border-t">
+                            <td className="p-1.5">
+                              {l.resource_type_label}
+                              {l.resource_name ? ` · ${l.resource_name}` : " (all)"}
+                            </td>
+                            <td className="p-1.5 font-mono">{l.effective_level}</td>
+                            <td className="p-1.5">{(l.granted_by ?? []).join(", ") || "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {grants.length > 0 && (
+                  <ul className="list-disc list-inside text-xs space-y-0.5">
+                    {grants.map((g) => (
+                      <li key={`${g.source}:${g.securable_type}:${g.full_name}:${g.privilege}`}>
+                        <span className="font-medium">{g.action === "revoke" ? "Revoke" : "Release (kept)"}</span>{" "}
+                        {g.privilege} on {g.full_name}
+                        {g.detail ? ` — ${g.detail}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {warnings.map((w) => (
+                  <p key={w} className="text-xs text-amber-600">{w}</p>
+                ))}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={deleteMapping.isPending}
+              onClick={(e) => {
+                e.preventDefault();
+                deleteMapping.mutate({ params: { mapping_id: mappingId } });
+              }}
+            >
+              {deleteMapping.isPending ? "Removing..." : "Remove & recompute"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -433,11 +558,13 @@ function AddGroupDialog({
   persona,
   personaLabel,
   availableGroups,
+  groupPersonas,
   onCreated,
 }: {
   persona: string;
   personaLabel: string;
   availableGroups: { id: string; display_name: string }[];
+  groupPersonas: Map<string, string[]>;
   onCreated: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -458,6 +585,7 @@ function AddGroupDialog({
   });
 
   const selectedGroupObj = availableGroups.find((g) => g.id === selectedGroup);
+  const stacksWith = selectedGroup ? groupPersonas.get(selectedGroup) ?? [] : [];
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -482,7 +610,7 @@ function AddGroupDialog({
         <div className="space-y-4 pt-4">
           {availableGroups.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              All groups are already mapped to personas.
+              All groups are already mapped to this persona.
             </p>
           ) : (
             <Select value={selectedGroup} onValueChange={setSelectedGroup}>
@@ -493,10 +621,18 @@ function AddGroupDialog({
                 {availableGroups.map((g) => (
                   <SelectItem key={g.id} value={g.id}>
                     {g.display_name}
+                    {groupPersonas.has(g.id) ? ` (also ${groupPersonas.get(g.id)?.join(", ")})` : ""}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+          )}
+          {stacksWith.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Personas stack: this group already has {stacksWith.join(", ")}. On
+              every object it will get the HIGHEST level any of its personas
+              grants. Run the Apply preview to check for escalations.
+            </p>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => setOpen(false)}>
@@ -886,8 +1022,14 @@ function DeletePersonaDialog({
                   {persona.groups.length !== 1 ? "s" : ""}
                 </li>
               )}
-              <li>All associated permission templates</li>
+              <li>All associated permission templates and per-space levels</li>
             </ul>
+            <span className="block mt-2">
+              Each mapped group is then recomputed from its remaining personas:
+              access only this persona gave is removed, and Genie table grants
+              it needed are revoked unless another persona or bundle still needs
+              them (pre-existing grants are never revoked).
+            </span>
             <span className="block mt-2">This action cannot be undone.</span>
           </AlertDialogDescription>
         </AlertDialogHeader>
