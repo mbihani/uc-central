@@ -133,6 +133,13 @@ drops or rewrites data:
   * On Postgres, the transitional `''` default on `group_id` is then dropped
     and the non-empty CHECK is added, so an upgraded database is as strict as
     a fresh one.
+  * `genie_grant_ledger.source` (why the grant is needed: `bundle:<id>` or
+    `persona:<key>:space:<space id>`) and `persona` are added. Every existing
+    row came from a bundle and is backfilled to `bundle:<bundle_id>`.
+    `bundle_id` becomes optional (persona rows have none). The uniqueness key
+    moves from (bundle, principal, grant) to (source, group_id, grant), with a
+    `CHECK (source <> '')`. A row that can't be given a source, or that would
+    break the new key, fails startup loudly and changes nothing.
   * The unique index `uq_genie_access_bundle_space_id` is created. **If that
     database already has several bundles for one space, startup fails loudly**
     with a `RuntimeError` naming each space and its bundle count. Nothing is
@@ -145,21 +152,25 @@ The two tables:
 * `genie_access_bundle` has one row per space (unique index on `space_id`).
   `group_id` is the group's identity; `group_name` is its current display name.
 * `genie_grant_ledger` has one row per privilege a bundle relies on. Its
-  columns are: `bundle_id`, `group_id` (immutable; the lock and sharing key;
+  columns are: `source` (required: `bundle:<id>` or
+  `persona:<key>:space:<id>`, see [Stacked personas](#stacked-personas-and-per-space-genie-access)),
+  `bundle_id` / `persona` (whichever owns the source), `group_id` (immutable; the lock and sharing key;
   **required**: `NOT NULL`, no default, and `CHECK (group_id <> '')`; the app
   also refuses to write a row or take a lock without it),
   `space_id`, `principal` (the group's display name as last seen; informational
   only), `securable_type` (`genie_space` / `catalog` / `schema` / `table` /
   `volume`), `full_name`, `privilege`, `app_granted`, `state`
   (`pending` / `confirmed`), `granted_at`, `granted_by`. A UNIQUE constraint
-  covers (bundle, principal, securable, privilege). Only *that* uniqueness
+  covers (source, group_id, securable, full_name, privilege). Only *that* uniqueness
   conflict is treated as "already recorded"; any other integrity error is
   raised.
 
 `app_granted = true` means UC Central issued the grant.
 `app_granted = false` means the privilege already existed when the bundle was
-applied. The bundle still records it so that **another bundle never revokes it
-out from under this one**, but the app never revokes it itself.
+applied. The bundle still records it so that **another bundle (or persona)
+never revokes it out from under this one**, but the app never revokes it
+itself. "Still needed" is decided across every source of the same group id,
+so bundles and personas share grants safely.
 
 ### Grant-before-ledger: pending rows
 
@@ -297,9 +308,11 @@ GRANT MANAGE ON CATALOG <catalog> TO `<app-service-principal-application-id>`;
     *not found*. It drops the bundle and its ledger rows **without any
     workspace call** and lists them in the response for audit. You can then
     create a new bundle for the new group on that space.
-* Use a **dedicated** group per bundle, and don't map it to a persona. A
-  persona Apply rewrites the Genie-space ACL of every group mapped to that
-  persona. The preview warns if the group is persona-mapped.
+* A bundle group may also be mapped to personas: they stack. Persona Apply
+  keeps the group's level on the bundle's space at the highest of its personas
+  and the bundle (an applied bundle counts as `CAN_RUN`), and a shared table
+  grant is revoked only when neither the bundle nor any persona still needs
+  it. The bundle preview lists the group's personas.
 
 ### Membership
 
@@ -321,14 +334,126 @@ New persona templates now default the **Genie spaces** cell to
 Previously they defaulted to `CAN_RUN` / `CAN_READ` on every space, but that
 access carried no data access, so it didn't work anyway. Admin and Deployer
 keep `CAN_MANAGE`, because that is space management rather than consumption.
-Genie consumption is granted only through bundles.
+Genie consumption is granted through bundles, or through a persona whose
+Genie level is raised deliberately (per space, see below) — which then also
+grants the space's tables.
 
 **Existing saved templates are not changed.** Seeding is `INSERT … ON CONFLICT
 DO NOTHING`, so a database that already has the old cells keeps them. To move
 an existing deployment to bundle-only Genie access, set those cells to "No
 permission" in the Permissions Matrix and re-apply the personas. Applying a
-`NO_PERMISSIONS` cell **removes** that persona's groups from every space's
-ACL, so first make sure the affected users are in the right bundle groups.
+`NO_PERMISSIONS` cell means "this persona grants nothing": a group's entry is
+removed only when none of its personas (or bundles) grants anything there, so
+first make sure the affected users are in the right bundle groups or personas.
+
+## Stacked personas and per-space Genie access
+
+### Several personas per group, highest wins
+
+A group may map to **several** personas. On every object, the group's
+**effective** level is the **highest** level any of its personas grants there
+(union, the same additive model Databricks uses for a user in several groups).
+`NO_PERMISSIONS` in a persona means *this persona grants nothing*, never
+"deny". Applying any one of the group's personas writes the group's effective
+level, so applying a "low" persona can never strip access another persona of
+the same group gives. The app still never raises a group because of personas
+its *members* hold through *other* groups; Databricks unions those at access
+time.
+
+Removing a persona from a group (or deleting the persona) **recomputes** the
+group from its remaining personas and applied bundles, on the resource types
+the removed persona granted something on. Each resource's entry is set to what
+is left (removed only if nothing grants it), and the persona's Genie table
+grants are released: revoked only if the app made them and no other persona or
+bundle of that group still needs them. A removal preview
+(`GET /api/personas/mappings/{id}/removal-preview`) shows the result first and
+writes nothing.
+
+Why there used to be one persona per group: the original apply wrote each
+group's ACL straight from *its one* persona's cell, so a second persona would
+have overwritten the first (last apply wins). The `UNIQUE (group_id)` on
+`persona_group_mapping` (commit `224434a`) only made that existing
+check-then-insert rule race-proof. Highest-wins stacking removes the conflict.
+The startup migration `ensure_persona_stacking_schema` drops
+`uq_persona_group_mapping_group_id`, keeps `UNIQUE (group_id, persona)`, and
+changes or deletes no mapping row (on SQLite the table is rebuilt and every
+row copied). It is idempotent, and it creates the `persona_resource_override`
+table.
+
+### Genie: one level for all spaces, or per space
+
+In the Permissions Matrix, a persona's Genie cell is its level for **all
+spaces**. The "per space…" link under it overrides that level for individual
+spaces, **higher or lower** (`No permission` = this persona grants nothing on
+that space). Overrides are stored in `persona_resource_override` and only
+replace *that persona's* level; stacking across a group's personas still takes
+the highest. Nothing reaches the workspace until the persona is applied.
+
+### Table grants follow Genie access
+
+Genie runs queries with the asking user's own UC rights. So when a persona
+Apply leaves a group with **Can View (`CAN_READ`) / Can Run or higher** on a
+space, each persona responsible becomes a grant source
+(`persona:<key>:space:<id>`) and the group gets, **per table** (never
+schema-wide), `SELECT` on each table / view / metric view the space uses
+(`READ_VOLUME` on volumes), plus `USE_SCHEMA` and `USE_CATALOG` on the
+parents. This reuses the bundle engine unchanged: discovery, pending →
+confirmed ledger rows, per-grant advisory locks keyed on the group **id**,
+pre-existing grants recorded but never revoked, and the shared-grant revoke
+rule. Several groups on one space each get and lose their own grants. A grant
+that a bundle and a persona both rely on is issued once and revoked only after
+the last of them lets go.
+
+Least privilege:
+
+* **Account groups only.** A workspace-local group (or one whose type can't
+  be confirmed) gets **no** Genie change: its entry is left untouched and Apply
+  reports why. The same happens when the space can't be read or nothing in it
+  resolves, so Genie access is never given without the data grants it needs.
+* Non-admin default personas give **no** Genie access.
+* The Apply preview makes **zero** database or workspace writes. Per group and
+  object it shows the effective level; which persona(s) / bundle(s) give it;
+  an **escalation** flag when stacking lifts a group above what its other
+  sources give (e.g. `CAN_MANAGE` on top of `CAN_RUN`); the table grants to
+  add / keep / revoke / release; and which of those tables already have a row
+  filter or column masks.
+* Genie edits on the **Resources** page stay space-only (no table grants). Its
+  dialog warns about that and names the persona-mapped groups, whose access
+  the persona Apply decides (and will overwrite).
+
+### Example: Sales Genie and HR Genie
+
+Two Genie spaces: **Sales Genie** (tables `main.sales.orders`,
+`main.finance.revenue_metrics`) and **HR Genie** (`main.hr.headcount`).
+
+| Persona | Genie: all spaces | Sales Genie | HR Genie |
+|---|---|---|---|
+| Sales Analyst | No permission | **Can Run** | — |
+| HR Analyst | No permission | — | **Can Run** |
+| Space Admin | No permission | **Can Manage** | — |
+
+Account group `analytics-leads` is mapped to **Sales Analyst** and **HR
+Analyst**; account group `sales-reps` only to **Sales Analyst**.
+
+Applying either persona gives:
+
+* `analytics-leads`: Can Run on Sales Genie (from Sales Analyst) and Can Run
+  on HR Genie (from HR Analyst). `SELECT` on `orders`, `revenue_metrics` and
+  `headcount`; `USE_SCHEMA` on `main.sales`, `main.finance` and `main.hr`;
+  `USE_CATALOG` on `main` (granted once, needed by both personas).
+* `sales-reps`: Can Run on Sales Genie only, with its own `SELECT` on the two
+  Sales tables and the parents. No HR access.
+
+If `analytics-leads` is also mapped to **Space Admin**, the preview flags an
+escalation on Sales Genie ("Stacking raises this group from CAN_RUN (best of
+sales_analyst) to CAN_MANAGE via space_admin"). The table grants don't change;
+they were already there.
+
+If **HR Analyst** is then removed from `analytics-leads`, its HR Genie entry is
+removed (nothing else grants HR), and `SELECT` on `headcount` and `USE_SCHEMA`
+on `main.hr` are revoked (if the app made them). `USE_CATALOG` on `main` stays
+because Sales Analyst still needs it. Sales access is untouched, and
+`sales-reps` is never affected, because grants are tracked per group id.
 
 ## Operator runbook
 
@@ -421,9 +546,10 @@ drives revocation.
 PGAPPNAME=test PYTHONPATH=src python -m pytest src/permissions_app/tests
 ```
 
-The repo has no CI. The 14 concurrency, pool and migration tests that need
-**real Postgres** semantics (READ COMMITTED, advisory locks, a real
-connection pool) are skipped unless `UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
+The repo has no CI. The tests that need **real Postgres** semantics (READ
+COMMITTED, advisory locks, a real connection pool, Postgres DDL migrations —
+and a Postgres run of every stacked-persona test) are skipped unless
+`UCG_TEST_PG_URL` is set. To run them against a throwaway local Postgres:
 
 ```bash
 initdb -D /tmp/ucg-pg -U postgres --auth=trust

@@ -500,3 +500,29 @@ def test_persona_stacking_migration_is_idempotent_and_keeps_data(kind, tmp_path)
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS persona_group_mapping"))
     engine.dispose()
+
+
+def test_resources_page_genie_edit_is_space_only(ws):
+    from permissions_app.backend.models import SetPermissionIn
+    from permissions_app.backend.router import set_resource_permissions
+
+    set_resource_permissions(
+        GENIE, SALES, [SetPermissionIn(group_name=GROUP, permission_level=PermissionLevel.CAN_RUN)], ws
+    )
+    assert ws.level(SALES) == CAN_RUN
+    assert ws.updates == []  # no UC table / schema / catalog grants
+
+
+def test_preview_checks_presence_per_group(session, ws):
+    """Two groups on one space: one already holds SELECT on orders, the other
+    does not. The preview must not reuse one group's grant read for the other."""
+    _sales_hr(session)
+    _map(session, "sales_analyst")
+    _map(session, "sales_analyst", "g-3", HR_GROUP)
+    ws.uc[("table", ORDERS)] = {GROUP: {"SELECT"}}
+
+    out = preview_apply_permissions("sales_analyst", ws, session)
+
+    actions = {(g.group_name, g.full_name, g.privilege): g.action for g in out.table_grants}
+    assert actions[(GROUP, ORDERS, "SELECT")] == "present"
+    assert actions[(HR_GROUP, ORDERS, "SELECT")] == "add"

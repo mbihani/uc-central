@@ -455,7 +455,9 @@ def table_grant_rows(ws: WorkspaceClient, session: Session, plan: GeniePlan) -> 
             for k in e.keys:
                 pending_needed.setdefault((e.group_id, k), set()).add(src.key)
     stale_ids = {r.id for r in plan.stale_rows}
-    cache: dict[tuple[str, str], list] = {}
+    # Effective-grant reads are per principal: one cache PER GROUP (the bundle
+    # engine's cache is keyed on the securable only).
+    caches: dict[str, dict[tuple[str, str], list]] = {}
 
     def row_out(e_gid, e_name, space_id, title, source, k, action, detail=None):
         obj = None
@@ -495,7 +497,7 @@ def table_grant_rows(ws: WorkspaceClient, session: Session, plan: GeniePlan) -> 
                     ))
                     continue
                 try:
-                    present, detail = _is_present(ws, e.group_name, k, cache)
+                    present, detail = _is_present(ws, e.group_name, k, caches.setdefault(e.group_id, {}))
                 except UCGrantError as err:
                     out.append(row_out(e.group_id, e.group_name, e.space_id, e.space_title, src.key, k, "error", str(err)))
                     continue
