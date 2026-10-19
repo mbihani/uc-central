@@ -961,6 +961,12 @@ def test_operation_lock_order_is_enforced(session):
         with pytest.raises(RuntimeError, match="global order"):  # group -> persona: refused
             with gb.operation_locks(session, personas=["p"]):
                 pass
+        with gb.operation_locks(session, users=["ann@example.com"]):  # group -> user: OK
+            with pytest.raises(RuntimeError, match="global order"):  # user -> group: refused
+                with gb.operation_locks(session, group_ids=["g-2"]):
+                    pass
+    with gb.operation_locks(session, personas=["p"], group_ids=["g-1"], users=["a", "b"]):
+        pass  # all three classes at once, in order
     assert session.info[gb._HELD_OP_LOCKS] == []
 
 
@@ -1165,3 +1171,127 @@ def test_failed_direct_user_cleanup_keeps_mapping_and_persona_then_retry(session
     assert _user_mappings(session, "p_run") == []
     assert _user_level(ws, SALES, BOB) is None and _user_level(ws, HR, BOB) is None
     assert _user_level(ws, SALES, ANN) == CAN_READ
+
+
+# ═══ Review round 7: direct-user operations across DIFFERENT personas ═══
+
+
+def _pg_users_setup(engine, ws, *, p2_mapped=True):
+    """p1 = CAN_RUN on every Genie space, p2 = CAN_READ. Ann holds p1 (and p2
+    unless told otherwise); her per-user ACLs reflect that (CAN_RUN)."""
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        _persona(s, "p1", {GENIE: CAN_RUN})
+        _persona(s, "p2", {GENIE: CAN_READ})
+        _direct(s, "p1", ANN, "1")
+        if p2_mapped:
+            _direct(s, "p2", ANN, "1")
+    for space in (SALES, HR):
+        ws.space_acl[space][("user", ANN)] = CAN_RUN
+
+
+def _race(engine, monkeypatch, first, second):
+    """Run ``first`` until its FIRST per-user ACL write (i.e. after it computed
+    the user's level), pause it there, run ``second``; ``second`` must wait
+    for the user lock. Then let both finish."""
+    import threading
+
+    from permissions_app.backend import router
+
+    paused, go = threading.Event(), threading.Event()
+    real = router.apply_user_acl
+    seen = {"n": 0}
+
+    def gated(*a, **k):
+        if threading.current_thread().name == "first" and seen["n"] == 0:
+            seen["n"] += 1
+            paused.set()
+            assert go.wait(20)
+        return real(*a, **k)
+
+    monkeypatch.setattr(router, "apply_user_acl", gated)
+    results: dict = {}
+    errors: list[str] = []
+
+    def run(name, fn):
+        try:
+            with Session(engine) as s:
+                results[name] = fn(s)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t1 = threading.Thread(name="first", target=run, args=("first", first))
+    t1.start()
+    assert paused.wait(20)
+    t2 = threading.Thread(name="second", target=run, args=("second", second))
+    t2.start()
+    t2.join(1.0)
+    waited = t2.is_alive()
+    go.set()
+    t1.join(30)
+    t2.join(30)
+    assert errors == [], errors
+    assert waited, "the second direct-user operation did not wait for the user lock"
+    return results
+
+
+def _remove(persona):
+    from permissions_app.backend.router import remove_persona_member
+
+    return lambda ws: (lambda s: remove_persona_member(persona, ANN, ws, s))
+
+
+def _add(persona):
+    from permissions_app.backend.models import PersonaUserMappingIn
+    from permissions_app.backend.router import create_persona_user_mapping
+
+    return lambda ws: (lambda s: create_persona_user_mapping(
+        PersonaUserMappingIn(user_id="1", user_name=ANN, display_name="Ann", persona=persona), ws, s
+    ))
+
+
+def _delete(persona):
+    return lambda ws: (lambda s: delete_persona(persona, ws, s, "admin"))
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_concurrent_removal_of_two_personas_leaves_no_acl_postgres(ws, monkeypatch):
+    engine = create_engine(PG_URL or "")
+    _pg_users_setup(engine, ws)
+    _race(engine, monkeypatch, _remove("p1")(ws), _remove("p2")(ws))
+    with Session(engine) as s:
+        assert _user_mappings(s, "p1") == [] and _user_mappings(s, "p2") == []
+    for space in (SALES, HR):
+        assert _user_level(ws, space, ANN) is None, ws.space_acl[space]
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+@pytest.mark.parametrize("drop", ["remove", "delete"])
+def test_add_concurrent_with_dropping_another_persona_postgres(ws, monkeypatch, drop):
+    engine = create_engine(PG_URL or "")
+    _pg_users_setup(engine, ws, p2_mapped=False)
+    first = (_remove("p1") if drop == "remove" else _delete("p1"))(ws)
+    _race(engine, monkeypatch, first, _add("p2")(ws))
+    with Session(engine) as s:
+        assert _user_mappings(s, "p1") == [] and _user_mappings(s, "p2") == [ANN]
+    for space in (SALES, HR):
+        assert _user_level(ws, space, ANN) == CAN_READ  # exactly p2's level
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_apply_concurrent_with_deleting_another_persona_postgres(ws, monkeypatch):
+    engine = create_engine(PG_URL or "")
+    _pg_users_setup(engine, ws)
+    apply_p2 = lambda s: apply_permissions("p2", ws, s, None, "admin")  # noqa: E731
+    _race(engine, monkeypatch, apply_p2, _delete("p1")(ws))
+    with Session(engine) as s:
+        assert _user_mappings(s, "p1") == [] and _user_mappings(s, "p2") == [ANN]
+    for space in (SALES, HR):
+        assert _user_level(ws, space, ANN) == CAN_READ  # highest of what is left
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()

@@ -397,14 +397,16 @@ removal if it is still wanted (or give it to the group through a persona).
 **Concurrency.** Persona operations take advisory locks (Postgres;
 process-local locks elsewhere) in **one global order**:
 
-    persona locks  ->  group locks  ->  per-grant locks   (each class ascending)
+    persona locks -> group locks -> user locks -> per-grant locks
+    (each class ascending; several locks of one class are taken at once)
 
 | Operation | Locks, in order |
 |---|---|
-| Persona delete | persona → each mapped group → grants |
-| Persona Apply | persona → its mapped groups → grants |
+| Persona delete | persona → each mapped group → grants; then (still under persona) all its direct users |
+| Persona Apply | persona → its mapped groups → grants; then all its direct users (per-user ACL sync) |
+| Add / remove a direct user | persona → user |
 | Create a mapping | persona |
-| Every other persona-keyed write: create / update persona, add / remove a direct user, set a matrix cell, set / clear a per-space override, the matrix backfill and lazy default-template seed | persona |
+| Every other persona-keyed write: create / update persona, set a matrix cell, set / clear a per-space override, the matrix backfill and lazy default-template seed | persona |
 | Remove a mapping | group → grants |
 | Bundle apply / resync / delete | grants only |
 
@@ -419,6 +421,18 @@ The same holds for **every** write that references a persona (helper
 `_persona_write`): it takes the persona lock and re-checks the persona under
 it (400/404 if gone). The matrix backfill and the lazy template seed insert
 cells only for personas that still exist, checked under their locks.
+
+**User locks** cover directly assigned users. They are keyed on `user_name`,
+which is the ACL principal, part of the mapping's unique key
+`(persona, user_name)`, and what the effective-level computation looks
+mappings up by (`user_id` is stored, but nothing keys on it). Add, remove,
+persona Apply's per-user ACL sync and persona delete's user cleanup all hold
+the user's lock across reading the user's mappings, writing the per-user ACLs
+and committing the mapping change, and re-read the mappings under it. So two
+operations on *different* personas of one user can never both compute from
+stale mappings: removing two of a user's personas at once leaves no persona
+ACL, adding one while another is removed leaves exactly the added one's
+level, and an Apply racing a delete ends at the correct highest-wins level.
 Nothing holding a lock waits for one of an earlier class or a smaller key, so
 there is no deadlock. Both rules are enforced at runtime. All locks of one
 operation share its single pooled connection.

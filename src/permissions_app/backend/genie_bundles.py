@@ -704,19 +704,31 @@ _HELD_OP_LOCKS = "persona_group_op_locks_held"
 # Operation-lock classes, in GLOBAL acquisition order. The complete lock order,
 # everywhere, is:
 #
-#     persona locks  ->  group locks  ->  per-grant locks
+#     persona locks  ->  group locks  ->  user locks  ->  per-grant locks
 #
-# each class in ascending key order. Persona delete: persona -> its groups ->
-# grants. Persona Apply: persona -> its groups -> grants. Mapping creation:
-# persona only. Mapping removal: group -> grants. Bundles: grants only.
+# each class in ascending key order; an operation needing several locks of one
+# class takes them all at once. Persona delete: persona -> its groups ->
+# grants, then (still under persona) its direct users. Persona Apply: persona
+# -> its groups -> grants, then its direct users. Direct-user add / remove:
+# persona -> user. Group mapping creation: persona. Mapping removal: group ->
+# grants. Bundles: grants only.
 # Nothing ever waits for a lock of an EARLIER class (or a smaller key of the
 # same class) while holding one, so there is no deadlock; both rules are
 # enforced at runtime (RuntimeError).
-PERSONA_LOCK, GROUP_LOCK = 0, 1
+PERSONA_LOCK, GROUP_LOCK, USER_LOCK = 0, 1, 2
 
 
 def persona_op_lock_key(persona: str) -> int:
     raw = "\x1f".join(["persona-op", persona]).encode()
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
+
+
+def user_op_lock_key(user_name: str) -> int:
+    """Lock key for a DIRECTLY assigned user. Keyed on ``user_name``: it is the
+    ACL principal, part of ``persona_user_mapping``'s unique key and what the
+    effective-level computation looks mappings up by (``user_id`` is stored
+    but nothing keys on it)."""
+    raw = "\x1f".join(["persona-user-op", user_name]).encode()
     return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
 
 
@@ -733,6 +745,7 @@ def operation_locks(
     *,
     personas: Iterable[str] = (),
     group_ids: Iterable[str] = (),
+    users: Iterable[str] = (),
 ) -> Iterator[None]:
     """Serialize persona operations, held across the whole block.
 
@@ -744,6 +757,11 @@ def operation_locks(
       and mapping deletion, so Apply never acts on a stale plan after a
       concurrent removal. Keyed on the group id, not (group, persona): Apply
       recreates rows for EVERY persona of a group.
+    * USER locks (direct-user assignments, keyed on ``user_name``): add,
+      remove, persona Apply's per-user ACL sync and persona delete's user
+      cleanup hold them across the user's mapping read, the per-user ACL
+      writes and the mapping commit, so two operations on DIFFERENT personas
+      of one user can never both compute from stale mappings.
 
     May be nested only in the global order above (e.g. a persona lock, then
     group locks inside it); never inside a grant lock. Postgres: session-level
@@ -752,6 +770,7 @@ def operation_locks(
     """
     wanted = [(PERSONA_LOCK, k) for k in sorted({persona_op_lock_key(p) for p in personas if p})]
     wanted += [(GROUP_LOCK, k) for k in sorted({group_op_lock_key(g) for g in group_ids if g})]
+    wanted += [(USER_LOCK, k) for k in sorted({user_op_lock_key(u) for u in users if u})]
     if session.info.get(_HELD_LOCKS):
         raise RuntimeError("Operation locks must be taken before any grant lock.")
     held: list[tuple[int, int]] = session.info.setdefault(_HELD_OP_LOCKS, [])
@@ -760,7 +779,8 @@ def operation_locks(
         return
     if held and wanted[0] <= max(held):
         raise RuntimeError(
-            "Operation locks must follow the global order (persona -> group, ascending keys)."
+            "Operation locks must follow the global order "
+            "(persona -> group -> user, ascending keys)."
         )
     if session.in_transaction():
         session.commit()

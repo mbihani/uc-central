@@ -794,13 +794,20 @@ def delete_persona(
             ]
         # Direct users: the SAME cleanup as remove_persona_member, per user;
         # each mapping is deleted only after that user's ACLs were recomputed.
+        # All their USER locks at once (order persona -> group -> user ->
+        # grant); mappings re-read under them.
+        def direct():
+            return session.exec(
+                select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
+            ).all()
+
         users: list[dict] = []
-        for um in session.exec(
-            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
-        ).all():
-            name = um.user_name
-            errs = _revoke_direct_user(obo_ws, session, persona_key, um)
-            users.append({"user_name": name, "removed": not errs, "errors": errs})
+        names = {um.user_name for um in direct()}
+        with operation_locks(session, users=names):
+            for um in [u for u in direct() if u.user_name in names]:
+                name = um.user_name
+                errs = _revoke_direct_user(obo_ws, session, persona_key, um)
+                users.append({"user_name": name, "removed": not errs, "errors": errs})
         users_left = session.exec(
             select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
         ).all()
@@ -1338,59 +1345,63 @@ def _create_persona_user_mapping_locked(
     body: PersonaUserMappingIn,
     persona_def: PersonaDefinition,
 ) -> dict:
-    # Upsert the PersonaUserMapping row race-safely via ON CONFLICT DO NOTHING.
-    # The UNIQUE(persona, user_name) constraint turns a concurrent duplicate add
-    # into a clean no-op rather than a 500 IntegrityError.
-    stmt = (
-        pg_insert(PersonaUserMapping.__table__)
-        .values(
-            user_id=body.user_id,
-            user_name=body.user_name,
-            display_name=body.display_name,
-            persona=body.persona,
+    # USER lock (after the persona lock): the upsert, the user's mapping
+    # read inside the ACL recompute and the ACL writes are atomic with respect
+    # to any other direct-user operation on this user.
+    with operation_locks(session, users=[body.user_name]):
+        # Upsert the PersonaUserMapping row race-safely via ON CONFLICT DO NOTHING.
+        # The UNIQUE(persona, user_name) constraint turns a concurrent duplicate add
+        # into a clean no-op rather than a 500 IntegrityError.
+        stmt = (
+            pg_insert(PersonaUserMapping.__table__)
+            .values(
+                user_id=body.user_id,
+                user_name=body.user_name,
+                display_name=body.display_name,
+                persona=body.persona,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["persona", "user_name"]
+            )
+            .returning(PersonaUserMapping.__table__.c.id)
         )
-        .on_conflict_do_nothing(
-            index_elements=["persona", "user_name"]
-        )
-        .returning(PersonaUserMapping.__table__.c.id)
-    )
-    result = session.execute(stmt)
-    session.commit()
-    was_new = result.fetchone() is not None
+        result = session.execute(stmt)
+        session.commit()
+        was_new = result.fetchone() is not None
 
-    # Load the persona's permission templates and immediately apply per-user ACLs.
-    templates = session.exec(
-        select(PermissionTemplate).where(PermissionTemplate.persona == body.persona)
-    ).all()
+        # Load the persona's permission templates and immediately apply per-user ACLs.
+        templates = session.exec(
+            select(PermissionTemplate).where(PermissionTemplate.persona == body.persona)
+        ).all()
 
-    _, acl_errors = _sync_direct_user_acl(obo_ws, session, body.user_name, templates)
+        _, acl_errors = _sync_direct_user_acl(obo_ws, session, body.user_name, templates)
 
-    if acl_errors:
-        logger.error(
-            f"Direct-add of user {body.user_name} to persona '{body.persona}': "
-            f"{len(acl_errors)} ACL error(s): {acl_errors}"
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"User was recorded as directly assigned to persona "
-                f"'{persona_def.label}' but {len(acl_errors)} ACL write(s) failed. "
-                f"Re-run Add or trigger Apply to retry. Errors: {acl_errors}"
+        if acl_errors:
+            logger.error(
+                f"Direct-add of user {body.user_name} to persona '{body.persona}': "
+                f"{len(acl_errors)} ACL error(s): {acl_errors}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"User was recorded as directly assigned to persona "
+                    f"'{persona_def.label}' but {len(acl_errors)} ACL write(s) failed. "
+                    f"Re-run Add or trigger Apply to retry. Errors: {acl_errors}"
+                ),
+            )
+
+        action = "added" if was_new else "already assigned (ACLs re-synced)"
+        return {
+            "status": "ok",
+            "persona": body.persona,
+            "user_id": body.user_id,
+            "user_name": body.user_name,
+            "message": (
+                f"User {action} directly to persona '{persona_def.label}' — "
+                f"per-user ACL entries written immediately (no Apply needed). "
+                f"Group membership was NOT changed."
             ),
-        )
-
-    action = "added" if was_new else "already assigned (ACLs re-synced)"
-    return {
-        "status": "ok",
-        "persona": body.persona,
-        "user_id": body.user_id,
-        "user_name": body.user_name,
-        "message": (
-            f"User {action} directly to persona '{persona_def.label}' — "
-            f"per-user ACL entries written immediately (no Apply needed). "
-            f"Group membership was NOT changed."
-        ),
-    }
+        }
 
 
 @api.delete(
@@ -1428,42 +1439,44 @@ def _remove_persona_member_locked(
     user_name: str,
     persona_def: PersonaDefinition,
 ) -> dict:
-    mapping = session.exec(
-        select(PersonaUserMapping).where(
-            PersonaUserMapping.persona == persona,
-            PersonaUserMapping.user_name == user_name,
-        )
-    ).first()
-    if not mapping:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"User '{user_name}' is not directly assigned to persona "
-                f"'{persona}'. (Group-based membership cannot be removed here.)"
-            ),
-        )
+    # USER lock (after the persona lock); the mapping is read under it.
+    with operation_locks(session, users=[user_name]):
+        mapping = session.exec(
+            select(PersonaUserMapping).where(
+                PersonaUserMapping.persona == persona,
+                PersonaUserMapping.user_name == user_name,
+            )
+        ).first()
+        if not mapping:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"User '{user_name}' is not directly assigned to persona "
+                    f"'{persona}'. (Group-based membership cannot be removed here.)"
+                ),
+            )
 
-    acl_errors = _revoke_direct_user(obo_ws, session, persona, mapping)
-    if acl_errors:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"ACL revoke failed for '{persona_def.label}' — DB mapping was "
-                f"NOT deleted so a retry or Apply can recover. "
-                f"Errors: {acl_errors}"
-            ),
-        )
+        acl_errors = _revoke_direct_user(obo_ws, session, persona, mapping)
+        if acl_errors:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"ACL revoke failed for '{persona_def.label}' — DB mapping was "
+                    f"NOT deleted so a retry or Apply can recover. "
+                    f"Errors: {acl_errors}"
+                ),
+            )
 
-    return {
-        "status": "ok",
-        "persona": persona,
-        "user_name": user_name,
-        "message": (
-            f"Direct assignment of '{user_name}' to persona '{persona_def.label}' "
-            f"removed — per-user ACL entries recomputed across remaining assignments. "
-            f"Group membership was NOT changed."
-        ),
-    }
+        return {
+            "status": "ok",
+            "persona": persona,
+            "user_name": user_name,
+            "message": (
+                f"Direct assignment of '{user_name}' to persona '{persona_def.label}' "
+                f"removed — per-user ACL entries recomputed across remaining assignments. "
+                f"Group membership was NOT changed."
+            ),
+        }
 
 
 def _revoke_direct_user(
@@ -1477,7 +1490,8 @@ def _revoke_direct_user(
     removed where none grants anything), then delete the mapping row — only if
     every ACL write succeeded. Returns the errors (mapping kept when non-empty).
     Shared by ``remove_persona_member`` and persona delete; the caller holds
-    the persona lock.
+    the persona lock AND the user's lock (see ``operation_locks``), and read
+    ``mapping`` under them.
 
     ACL revoke FIRST, DB delete only on success: if the row were deleted first
     and an ACL write failed, a retry would 404 and Apply would not find the
@@ -2265,21 +2279,31 @@ def _apply_mapped(
     # Re-sync per-user ACL entries for every user directly assigned to this persona.
     # Each user's effective level is the MAX across ALL their direct-persona assignments
     # (so a user in two personas always gets the higher of the two, never stale).
-    direct_users = session.exec(
-        select(PersonaUserMapping).where(PersonaUserMapping.persona == persona)
-    ).all()
+    # Under the USER locks of all of them (taken at once, after the group
+    # locks; order persona -> group -> user -> grant), with the mappings
+    # re-read under the locks, so a concurrent add / remove / delete of
+    # ANOTHER persona of the same user can't interleave with this recompute.
+    def direct():
+        return session.exec(
+            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona)
+        ).all()
+
+    names = {dm.user_name for dm in direct()}
     direct_users_synced = 0
-    for dm in direct_users:
-        user_updated, user_errors = _sync_direct_user_acl(obo_ws, session, dm.user_name, templates)
-        total_updated += user_updated
-        if user_errors:
-            logger.error(
-                f"Apply re-sync for direct user {dm.user_name} on persona "
-                f"'{persona}': {len(user_errors)} error(s): {user_errors}"
+    with operation_locks(session, users=names):
+        for dm in [d for d in direct() if d.user_name in names]:
+            user_updated, user_errors = _sync_direct_user_acl(
+                obo_ws, session, dm.user_name, templates
             )
-            total_errors += len(user_errors)
-        else:
-            direct_users_synced += 1
+            total_updated += user_updated
+            if user_errors:
+                logger.error(
+                    f"Apply re-sync for direct user {dm.user_name} on persona "
+                    f"'{persona}': {len(user_errors)} error(s): {user_errors}"
+                )
+                total_errors += len(user_errors)
+            else:
+                direct_users_synced += 1
 
     return ApplyAllResultOut(
         persona=persona,
