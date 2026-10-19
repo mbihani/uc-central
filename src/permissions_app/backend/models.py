@@ -1,11 +1,16 @@
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from .. import __version__
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
@@ -268,16 +273,25 @@ class PersonaDefinition(SQLModel, table=True):
     is_default: bool = Field(default=False)  # True for built-in personas
 
 
+PERSONA_GROUP_UNIQUE = "uq_persona_group_mapping_group_persona"
+# The pre-stacking constraint (one persona per group). Dropped by
+# seed.ensure_persona_stacking_schema; kept here only as a name to look for.
+LEGACY_PERSONA_GROUP_UNIQUE = "uq_persona_group_mapping_group_id"
+
+
 class PersonaGroupMapping(SQLModel, table=True):
-    """Maps a Databricks workspace group to a persona."""
+    """Maps a Databricks workspace group to a persona.
+
+    Personas STACK: a group may map to several personas. Its effective level on
+    an object is the HIGHEST level any of its personas grants there (union,
+    matching Databricks' additive ACL model); a persona's NO_PERMISSIONS means
+    "this persona grants nothing", never "deny". A (group, persona) pair is
+    unique — enforced in the DB so concurrent creates cannot duplicate it.
+    """
 
     __tablename__ = "persona_group_mapping"
-    # A workspace group maps to AT MOST ONE persona — the app already enforces
-    # this in ``create_persona_mapping`` (check-then-insert). The DB-level UNIQUE
-    # makes it race-proof: two concurrent creates for the same group can never
-    # both land, and the invariant holds even under the multi-worker startup.
     __table_args__ = (
-        UniqueConstraint("group_id", name="uq_persona_group_mapping_group_id"),
+        UniqueConstraint("group_id", "persona", name=PERSONA_GROUP_UNIQUE),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -328,6 +342,35 @@ class PermissionTemplate(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     persona: str = Field(index=True)  # references PersonaDefinition.key
     resource_type: str = Field(index=True)
+    permission_level: str
+
+
+PERSONA_OVERRIDE_UNIQUE = "uq_persona_resource_override"
+# Resource types whose matrix cell can be overridden per individual resource.
+OVERRIDABLE_RESOURCE_TYPES: frozenset[str] = frozenset({ResourceType.GENIE_SPACES.value})
+
+
+class PersonaResourceOverride(SQLModel, table=True):
+    """A persona's level for ONE resource, replacing its type-level cell there.
+
+    The type-level ``PermissionTemplate`` cell is the persona's "all spaces"
+    level; an override sets this persona's level on one specific resource (e.g.
+    one Genie space) — higher OR lower, including NO_PERMISSIONS ("this persona
+    grants nothing on this space"). Overrides only replace THIS persona's level;
+    stacking across a group's personas still takes the highest.
+    """
+
+    __tablename__ = "persona_resource_override"
+    __table_args__ = (
+        UniqueConstraint(
+            "persona", "resource_type", "resource_id", name=PERSONA_OVERRIDE_UNIQUE
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    persona: str = Field(index=True)  # references PersonaDefinition.key
+    resource_type: str = Field(index=True)
+    resource_id: str
     permission_level: str
 
 
@@ -442,6 +485,23 @@ class PermissionMatrixCell(BaseModel):
     permission_level: PermissionLevel
 
 
+class PermissionOverrideOut(BaseModel):
+    id: int
+    persona: str
+    resource_type: str
+    resource_id: str
+    permission_level: str
+
+
+class PermissionOverrideIn(BaseModel):
+    """Set (or, with ``permission_level=None``, clear) a per-resource override."""
+
+    persona: str
+    resource_type: ResourceType
+    resource_id: str
+    permission_level: Optional[PermissionLevel] = None
+
+
 class PermissionMatrixOut(BaseModel):
     matrix: list[PermissionTemplateOut]
     personas: list[str]
@@ -449,6 +509,8 @@ class PermissionMatrixOut(BaseModel):
     persona_labels: dict[str, str]
     resource_type_labels: dict[str, str]
     allowed_permission_levels: dict[str, list[str]]
+    overrides: list[PermissionOverrideOut] = []
+    overridable_resource_types: list[str] = []
 
 
 # Group / User models (for workspace scanning)
@@ -523,6 +585,11 @@ class ApplyAllResultOut(BaseModel):
     total_resources_updated: int
     total_errors: int
     direct_users_synced: int = 0
+    # Genie table grants that follow persona Genie levels (see persona_sync).
+    table_grants_added: int = 0
+    table_grants_revoked: int = 0
+    table_grant_errors: list[str] = []
+    warnings: list[str] = []
 
 
 # ─── Apply preview (dry-run) + type scoping models ───────────────────────────
@@ -592,6 +659,76 @@ class ApplyPreviewOut(BaseModel):
     skipped: list[ApplyPlanSkippedOut]
     total_resources_affected: int
     direct_user_count: int = 0
+    # Least-privilege detail (stacked personas): per group and object.
+    group_levels: list["GroupLevelOut"] = []
+    table_grants: list["TableGrantPlanOut"] = []
+    escalation_count: int = 0
+    warnings: list[str] = []
+
+
+class GroupLevelOut(BaseModel):
+    """A group's EFFECTIVE level on one object (or a whole resource type when
+    ``resource_id`` is None), and which personas / bundles produce it."""
+
+    group_id: str
+    group_name: str
+    resource_type: str
+    resource_type_label: str
+    resource_id: Optional[str] = None
+    resource_name: Optional[str] = None
+    effective_level: str
+    granted_by: list[str] = []  # sources whose level equals the effective level
+    source_levels: dict[str, str] = {}  # every source (persona / bundle) -> level
+    escalation: bool = False
+    escalation_detail: Optional[str] = None
+    blocked: Optional[str] = None  # why this group's entry will NOT be written
+
+
+class TableGrantPlanOut(BaseModel):
+    """One UC grant a persona Apply would add / keep / revoke for a group."""
+
+    group_id: str
+    group_name: str
+    space_id: str
+    space_title: str = ""
+    source: str  # e.g. "persona:analyst:space:<id>" or "bundle:3"
+    securable_type: str
+    full_name: str
+    privilege: str
+    # add | present (pre-existing, recorded, never revoked) | keep | revoke |
+    # release (source drops it, but another source / pre-existing keeps it) |
+    # blocked | error
+    action: str
+    detail: Optional[str] = None
+    has_row_filter: bool = False
+    masked_columns: list[str] = []
+
+
+class GroupResyncOut(BaseModel):
+    """Result of removing a persona from a group (recompute from the rest)."""
+
+    group_id: str
+    group_name: str
+    removed_persona: str
+    # False = cleanup failed; the mapping was KEPT and the removal can be retried.
+    mapping_removed: bool = False
+    resources_updated: int = 0
+    table_grants_added: int = 0
+    table_grants_revoked: int = 0
+    errors: list[str] = []
+    warnings: list[str] = []
+
+
+class GroupResyncPreviewOut(BaseModel):
+    group_id: str
+    group_name: str
+    removed_persona: str
+    group_levels: list[GroupLevelOut] = []
+    table_grants: list[TableGrantPlanOut] = []
+    warnings: list[str] = []
+
+
+ApplyPreviewOut.model_rebuild()
 
 
 # Dashboard stats
@@ -681,3 +818,193 @@ class PermissionConflictsOut(BaseModel):
     total_users_checked: int
     users_with_conflicts: int
     conflicts: list[UserPermissionConflict]
+
+
+# ─── Genie access bundles ────────────────────────────────────────────────────
+#
+# A bundle ties ONE Genie space to ONE pre-existing ACCOUNT-level group. Applying
+# it grants the group CAN_RUN on the space plus the per-table UC privileges the
+# space needs (SELECT on each table/view, USE_SCHEMA / USE_CATALOG on each
+# parent). Every privilege the bundle relies on is recorded in the grant ledger;
+# revocation is driven ONLY by the ledger, so the app never revokes a grant it
+# did not create. See docs/genie-access-bundles.md.
+
+
+GENIE_BUNDLE_SPACE_UNIQUE = "uq_genie_access_bundle_space_id"
+GENIE_LEDGER_GROUP_ID_CHECK = "ck_genie_grant_ledger_group_id_nonempty"
+GENIE_LEDGER_SOURCE_CHECK = "ck_genie_grant_ledger_source_nonempty"
+GENIE_LEDGER_SOURCE_UNIQUE = "uq_genie_grant_ledger_source_grant"
+# Pre-source unique constraint, dropped by seed.ensure_genie_bundle_schema.
+LEGACY_LEDGER_UNIQUE = "uq_genie_grant_ledger_bundle_grant"
+
+# Grant-ledger row states. A PENDING row is written durably BEFORE the workspace
+# grant call and flipped to CONFIRMED after it, so a crash in between can be
+# reconciled instead of leaving an untracked app-created grant.
+LEDGER_PENDING = "pending"
+LEDGER_CONFIRMED = "confirmed"
+
+
+class GenieAccessBundle(SQLModel, table=True):
+    """One Genie space <-> one account group."""
+
+    __tablename__ = "genie_access_bundle"
+    # ONE group per space. A unique INDEX (not a table constraint) so the same
+    # DDL — CREATE UNIQUE INDEX IF NOT EXISTS — upgrades databases created before
+    # this rule existed (see seed.ensure_genie_bundle_schema).
+    __table_args__ = (
+        Index(GENIE_BUNDLE_SPACE_UNIQUE, "space_id", unique=True),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    space_id: str = Field(index=True)
+    space_title: str = ""
+    # group_id (immutable SCIM id) is the identity; group_name is the CURRENT
+    # display name, refreshed from group_id before every operation.
+    group_name: str = Field(index=True)
+    group_id: str = ""
+    created_by: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_applied_at: Optional[datetime] = None
+    last_applied_by: Optional[str] = None
+    # Reserved for the row/column restriction follow-up (docs/genie-access-
+    # bundles.md): "none" today; later e.g. "row_filter" or "abac". Nothing in
+    # this PR reads it beyond echoing it back.
+    restriction_mode: str = "none"
+
+
+class GenieGrantLedger(SQLModel, table=True):
+    """One privilege a bundle relies on, on one securable, for its group.
+
+    ``app_granted`` is True when THIS app issued the grant (or inherited
+    ownership of an app-issued grant from a deleted bundle). Rows with
+    ``app_granted=False`` record a privilege that already existed when the
+    bundle was applied: they mark the privilege as "needed" (so another bundle
+    never revokes it out from under this one) but are never revoked themselves.
+    """
+
+    __tablename__ = "genie_grant_ledger"
+    __table_args__ = (
+        # One row per (source, group, grant). Refcounting ("does anything else
+        # still need this grant?") compares SOURCES for the same group id.
+        UniqueConstraint(
+            "source",
+            "group_id",
+            "securable_type",
+            "full_name",
+            "privilege",
+            name=GENIE_LEDGER_SOURCE_UNIQUE,
+        ),
+        CheckConstraint("source <> ''", name=GENIE_LEDGER_SOURCE_CHECK),
+        # group_id is the identity / lock / sharing key: never empty. (NOT NULL
+        # comes from the required field below.) There is NO foreign key to
+        # genie_access_bundle, so seed.ensure_genie_bundle_schema also refuses
+        # to start if any row lacks it.
+        CheckConstraint("group_id <> ''", name=GENIE_LEDGER_GROUP_ID_CHECK),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    # WHY this grant is needed: "bundle:<id>" or "persona:<key>:space:<id>".
+    source: str = Field(index=True, nullable=False)  # REQUIRED: no default
+    bundle_id: Optional[int] = Field(default=None, index=True)  # bundle sources
+    persona: Optional[str] = Field(default=None, index=True)  # persona sources
+    # Immutable SCIM id of the bundle's group: the key for per-grant locks and
+    # for "does another bundle still need this grant?". ``principal`` is the
+    # group's display name as last seen (informational; UC calls re-resolve it).
+    group_id: str = Field(index=True, nullable=False)  # REQUIRED: no default
+    space_id: str = Field(index=True)
+    principal: str = Field(index=True)
+    # "genie_space" (ACL CAN_RUN) or a UC securable type: catalog/schema/table/volume.
+    securable_type: str
+    full_name: str = Field(index=True)
+    privilege: str
+    app_granted: bool = Field(default=True)
+    state: str = Field(default=LEDGER_CONFIRMED)  # LEDGER_PENDING | LEDGER_CONFIRMED
+    granted_at: datetime = Field(default_factory=_utcnow)
+    granted_by: str = ""
+
+
+class GenieBundleIn(BaseModel):
+    space_id: str
+    group_name: str
+
+
+class GenieBundleOut(BaseModel):
+    id: int
+    space_id: str
+    space_title: str
+    group_name: str
+    group_id: str
+    created_by: str
+    created_at: datetime
+    last_applied_at: Optional[datetime] = None
+    last_applied_by: Optional[str] = None
+    restriction_mode: str = "none"
+    ledger_count: int = 0
+
+
+class GenieGroupCheckOut(BaseModel):
+    group_name: str
+    group_id: Optional[str] = None
+    exists: bool
+    is_account_group: bool
+    # SCIM meta.resourceType: "Group" (account group) or "WorkspaceGroup".
+    resource_type: Optional[str] = None
+    error: Optional[str] = None
+    # Set when the group (same SCIM id) now has a different display name than
+    # the bundle recorded. Preview only reports it; mutating paths persist it.
+    renamed_from: Optional[str] = None
+
+
+class GenieSpaceObjectOut(BaseModel):
+    """A data source referenced by the space's serialized definition."""
+
+    kind: str  # "table" (tables, views, MVs, metric views) or "volume"
+    identifier: str  # as written in the serialized space
+    full_name: Optional[str] = None  # resolved catalog.schema.name
+    table_type: Optional[str] = None  # MANAGED / VIEW / METRIC_VIEW / ...
+    resolved: bool
+    reason: Optional[str] = None  # why it could not be resolved
+    has_row_filter: bool = False
+    row_filter_function: Optional[str] = None
+    masked_columns: list[str] = []
+
+
+class GenieGrantOut(BaseModel):
+    securable_type: str
+    full_name: str
+    privilege: str
+    # missing      — would be / was granted by this bundle
+    # present      — already effective, not created by the app (never revoked)
+    # managed      — already effective AND owned by the app's ledger
+    # stale        — in this bundle's ledger but no longer needed (resync drops it)
+    status: str
+    detail: Optional[str] = None
+
+
+class GenieBundlePreviewOut(BaseModel):
+    bundle_id: int
+    space_id: str
+    space_title: str
+    warehouse_id: Optional[str] = None
+    group: GenieGroupCheckOut
+    objects: list[GenieSpaceObjectOut]
+    grants: list[GenieGrantOut]
+    stale_grants: list[GenieGrantOut] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    can_apply: bool
+
+
+class GenieBundleActionOut(BaseModel):
+    bundle_id: int
+    action: str  # apply | resync | delete
+    status: str  # ok | partial | failed
+    granted: list[GenieGrantOut] = []
+    adopted: list[GenieGrantOut] = []
+    revoked: list[GenieGrantOut] = []
+    released: list[GenieGrantOut] = []
+    # PENDING rows from an interrupted run, confirmed or dropped this run.
+    reconciled: list[GenieGrantOut] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    deleted: bool = False

@@ -9,8 +9,12 @@ export interface ApplyAllResultOut {
   direct_users_synced?: number;
   persona: string;
   results: ApplyResultOut[];
+  table_grant_errors?: string[];
+  table_grants_added?: number;
+  table_grants_revoked?: number;
   total_errors: number;
   total_resources_updated: number;
+  warnings?: string[];
 }
 
 export interface ApplyPermissionsIn {
@@ -33,12 +37,16 @@ export interface ApplyPlanSkippedOut {
 
 export interface ApplyPreviewOut {
   direct_user_count?: number;
+  escalation_count?: number;
   group_count: number;
+  group_levels?: GroupLevelOut[];
   groups: string[];
   persona: string;
   plan: ApplyPlanItemOut[];
   skipped: ApplyPlanSkippedOut[];
+  table_grants?: TableGrantPlanOut[];
   total_resources_affected: number;
+  warnings?: string[];
 }
 
 export interface ApplyResultOut {
@@ -64,6 +72,98 @@ export interface DashboardStatsOut {
   unassigned_users: number;
 }
 
+export interface GenieBundleActionOut {
+  action: string;
+  adopted?: GenieGrantOut[];
+  bundle_id: number;
+  deleted?: boolean;
+  errors?: string[];
+  granted?: GenieGrantOut[];
+  reconciled?: GenieGrantOut[];
+  released?: GenieGrantOut[];
+  revoked?: GenieGrantOut[];
+  status: string;
+  warnings?: string[];
+}
+
+export interface GenieBundleIn {
+  group_name: string;
+  space_id: string;
+}
+
+export interface GenieBundleOut {
+  created_at: string;
+  created_by: string;
+  group_id: string;
+  group_name: string;
+  id: number;
+  last_applied_at?: string | null;
+  last_applied_by?: string | null;
+  ledger_count?: number;
+  restriction_mode?: string;
+  space_id: string;
+  space_title: string;
+}
+
+export interface GenieBundlePreviewOut {
+  blockers?: string[];
+  bundle_id: number;
+  can_apply: boolean;
+  grants: GenieGrantOut[];
+  group: GenieGroupCheckOut;
+  objects: GenieSpaceObjectOut[];
+  space_id: string;
+  space_title: string;
+  stale_grants?: GenieGrantOut[];
+  warehouse_id?: string | null;
+  warnings?: string[];
+}
+
+export interface GenieGrantOut {
+  detail?: string | null;
+  full_name: string;
+  privilege: string;
+  securable_type: string;
+  status: string;
+}
+
+export interface GenieGroupCheckOut {
+  error?: string | null;
+  exists: boolean;
+  group_id?: string | null;
+  group_name: string;
+  is_account_group: boolean;
+  renamed_from?: string | null;
+  resource_type?: string | null;
+}
+
+export interface GenieSpaceObjectOut {
+  full_name?: string | null;
+  has_row_filter?: boolean;
+  identifier: string;
+  kind: string;
+  masked_columns?: string[];
+  reason?: string | null;
+  resolved: boolean;
+  row_filter_function?: string | null;
+  table_type?: string | null;
+}
+
+export interface GroupLevelOut {
+  blocked?: string | null;
+  effective_level: string;
+  escalation?: boolean;
+  escalation_detail?: string | null;
+  granted_by?: string[];
+  group_id: string;
+  group_name: string;
+  resource_id?: string | null;
+  resource_name?: string | null;
+  resource_type: string;
+  resource_type_label: string;
+  source_levels?: Record<string, string>;
+}
+
 export interface GroupMemberOut {
   display_name?: string | null;
   user_id: string;
@@ -75,6 +175,27 @@ export interface GroupOut {
   id: string;
   member_count?: number;
   members?: GroupMemberOut[];
+}
+
+export interface GroupResyncOut {
+  errors?: string[];
+  group_id: string;
+  group_name: string;
+  mapping_removed?: boolean;
+  removed_persona: string;
+  resources_updated?: number;
+  table_grants_added?: number;
+  table_grants_revoked?: number;
+  warnings?: string[];
+}
+
+export interface GroupResyncPreviewOut {
+  group_id: string;
+  group_levels?: GroupLevelOut[];
+  group_name: string;
+  removed_persona: string;
+  table_grants?: TableGrantPlanOut[];
+  warnings?: string[];
 }
 
 export interface HTTPValidationError {
@@ -136,10 +257,27 @@ export interface PermissionMatrixCell {
 export interface PermissionMatrixOut {
   allowed_permission_levels: Record<string, string[]>;
   matrix: PermissionTemplateOut[];
+  overridable_resource_types?: string[];
+  overrides?: PermissionOverrideOut[];
   persona_labels: Record<string, string>;
   personas: string[];
   resource_type_labels: Record<string, string>;
   resource_types: string[];
+}
+
+export interface PermissionOverrideIn {
+  permission_level?: PermissionLevel | null;
+  persona: string;
+  resource_id: string;
+  resource_type: ResourceType;
+}
+
+export interface PermissionOverrideOut {
+  id: number;
+  permission_level: string;
+  persona: string;
+  resource_id: string;
+  resource_type: string;
 }
 
 export interface PermissionTemplateOut {
@@ -252,6 +390,21 @@ export interface SetPermissionIn {
   permission_level: PermissionLevel;
 }
 
+export interface TableGrantPlanOut {
+  action: string;
+  detail?: string | null;
+  full_name: string;
+  group_id: string;
+  group_name: string;
+  has_row_filter?: boolean;
+  masked_columns?: string[];
+  privilege: string;
+  securable_type: string;
+  source: string;
+  space_id: string;
+  space_title?: string;
+}
+
 export interface User {
   active?: boolean | null;
   display_name?: string | null;
@@ -314,6 +467,51 @@ export interface GetDashboardStatsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface ListGenieBundlesParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface CreateGenieBundleParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface DeleteGenieBundleParams {
+  bundle_id: number;
+  forget_orphaned?: boolean;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ApplyGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ListGenieBundleMembersParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface AddGenieBundleMemberParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface RemoveGenieBundleMemberParams {
+  bundle_id: number;
+  user_id: string;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface PreviewGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface ResyncGenieBundleParams {
+  bundle_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface ListGroupsParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -350,6 +548,10 @@ export interface UpdatePermissionMatrixParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
 
+export interface SetPermissionOverrideParams {
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
 export interface ListPersonasParams {
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -363,6 +565,11 @@ export interface CreatePersonaMappingParams {
 }
 
 export interface DeletePersonaMappingParams {
+  mapping_id: number;
+  "X-Forwarded-Access-Token"?: string | null;
+}
+
+export interface PreviewPersonaMappingRemovalParams {
   mapping_id: number;
   "X-Forwarded-Access-Token"?: string | null;
 }
@@ -499,6 +706,169 @@ export function useGetDashboardStats<TData = { data: DashboardStatsOut }>(option
 
 export function useGetDashboardStatsSuspense<TData = { data: DashboardStatsOut }>(options?: { params?: GetDashboardStatsParams; query?: Omit<UseSuspenseQueryOptions<{ data: DashboardStatsOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
   return useSuspenseQuery({ queryKey: getDashboardStatsKey(options?.params), queryFn: () => getDashboardStats(options?.params), ...options?.query });
+}
+
+export const listGenieBundles = async (params?: ListGenieBundlesParams, options?: RequestInit): Promise<{ data: GenieBundleOut[] }> => {
+  const res = await fetch("/api/genie-bundles", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const listGenieBundlesKey = (params?: ListGenieBundlesParams) => {
+  return ["/api/genie-bundles", params] as const;
+};
+
+export function useListGenieBundles<TData = { data: GenieBundleOut[] }>(options?: { params?: ListGenieBundlesParams; query?: Omit<UseQueryOptions<{ data: GenieBundleOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: listGenieBundlesKey(options?.params), queryFn: () => listGenieBundles(options?.params), ...options?.query });
+}
+
+export function useListGenieBundlesSuspense<TData = { data: GenieBundleOut[] }>(options?: { params?: ListGenieBundlesParams; query?: Omit<UseSuspenseQueryOptions<{ data: GenieBundleOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: listGenieBundlesKey(options?.params), queryFn: () => listGenieBundles(options?.params), ...options?.query });
+}
+
+export const createGenieBundle = async (data: GenieBundleIn, params?: CreateGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleOut }> => {
+  const res = await fetch("/api/genie-bundles", { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useCreateGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleOut }, ApiError, { params: CreateGenieBundleParams; data: GenieBundleIn }> }) {
+  return useMutation({ mutationFn: (vars) => createGenieBundle(vars.data, vars.params), ...options?.mutation });
+}
+
+export const deleteGenieBundle = async (params: DeleteGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const searchParams = new URLSearchParams();
+  if (params?.forget_orphaned != null) searchParams.set("forget_orphaned", String(params?.forget_orphaned));
+  const queryString = searchParams.toString();
+  const url = queryString ? `/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}?${queryString}` : `/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}`;
+  const res = await fetch(url, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useDeleteGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: DeleteGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => deleteGenieBundle(vars.params), ...options?.mutation });
+}
+
+export const applyGenieBundle = async (params: ApplyGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/apply`, { ...options, method: "POST", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useApplyGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: ApplyGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => applyGenieBundle(vars.params), ...options?.mutation });
+}
+
+export const listGenieBundleMembers = async (params: ListGenieBundleMembersParams, options?: RequestInit): Promise<{ data: GroupMemberOut[] }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const listGenieBundleMembersKey = (params?: ListGenieBundleMembersParams) => {
+  return ["/api/genie-bundles/{bundle_id}/members", params] as const;
+};
+
+export function useListGenieBundleMembers<TData = { data: GroupMemberOut[] }>(options: { params: ListGenieBundleMembersParams; query?: Omit<UseQueryOptions<{ data: GroupMemberOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: listGenieBundleMembersKey(options.params), queryFn: () => listGenieBundleMembers(options.params), ...options?.query });
+}
+
+export function useListGenieBundleMembersSuspense<TData = { data: GroupMemberOut[] }>(options: { params: ListGenieBundleMembersParams; query?: Omit<UseSuspenseQueryOptions<{ data: GroupMemberOut[] }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: listGenieBundleMembersKey(options.params), queryFn: () => listGenieBundleMembers(options.params), ...options?.query });
+}
+
+export const addGenieBundleMember = async (params: AddGenieBundleMemberParams, data: AddMemberIn, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members`, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useAddGenieBundleMember(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: AddGenieBundleMemberParams; data: AddMemberIn }> }) {
+  return useMutation({ mutationFn: (vars) => addGenieBundleMember(vars.params, vars.data), ...options?.mutation });
+}
+
+export const removeGenieBundleMember = async (params: RemoveGenieBundleMemberParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/members/${encodeURIComponent(String(params.user_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useRemoveGenieBundleMember(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: RemoveGenieBundleMemberParams }> }) {
+  return useMutation({ mutationFn: (vars) => removeGenieBundleMember(vars.params), ...options?.mutation });
+}
+
+export const previewGenieBundle = async (params: PreviewGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundlePreviewOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const previewGenieBundleKey = (params?: PreviewGenieBundleParams) => {
+  return ["/api/genie-bundles/{bundle_id}/preview", params] as const;
+};
+
+export function usePreviewGenieBundle<TData = { data: GenieBundlePreviewOut }>(options: { params: PreviewGenieBundleParams; query?: Omit<UseQueryOptions<{ data: GenieBundlePreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: previewGenieBundleKey(options.params), queryFn: () => previewGenieBundle(options.params), ...options?.query });
+}
+
+export function usePreviewGenieBundleSuspense<TData = { data: GenieBundlePreviewOut }>(options: { params: PreviewGenieBundleParams; query?: Omit<UseSuspenseQueryOptions<{ data: GenieBundlePreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: previewGenieBundleKey(options.params), queryFn: () => previewGenieBundle(options.params), ...options?.query });
+}
+
+export const resyncGenieBundle = async (params: ResyncGenieBundleParams, options?: RequestInit): Promise<{ data: GenieBundleActionOut }> => {
+  const res = await fetch(`/api/genie-bundles/${encodeURIComponent(String(params.bundle_id))}/resync`, { ...options, method: "POST", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useResyncGenieBundle(options?: { mutation?: UseMutationOptions<{ data: GenieBundleActionOut }, ApiError, { params: ResyncGenieBundleParams }> }) {
+  return useMutation({ mutationFn: (vars) => resyncGenieBundle(vars.params), ...options?.mutation });
 }
 
 export const listGroups = async (params?: ListGroupsParams, options?: RequestInit): Promise<{ data: GroupOut[] }> => {
@@ -661,6 +1031,21 @@ export function useUpdatePermissionMatrix(options?: { mutation?: UseMutationOpti
   return useMutation({ mutationFn: (vars) => updatePermissionMatrix(vars.data, vars.params), ...options?.mutation });
 }
 
+export const setPermissionOverride = async (data: PermissionOverrideIn, params?: SetPermissionOverrideParams, options?: RequestInit): Promise<{ data: PermissionOverrideOut[] }> => {
+  const res = await fetch("/api/permissions/matrix/overrides", { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers }, body: JSON.stringify(data) });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export function useSetPermissionOverride(options?: { mutation?: UseMutationOptions<{ data: PermissionOverrideOut[] }, ApiError, { params: SetPermissionOverrideParams; data: PermissionOverrideIn }> }) {
+  return useMutation({ mutationFn: (vars) => setPermissionOverride(vars.data, vars.params), ...options?.mutation });
+}
+
 export const listPersonas = async (params?: ListPersonasParams, options?: RequestInit): Promise<{ data: PersonaOut[] }> => {
   const res = await fetch("/api/personas", { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
@@ -714,7 +1099,7 @@ export function useCreatePersonaMapping(options?: { mutation?: UseMutationOption
   return useMutation({ mutationFn: (vars) => createPersonaMapping(vars.data, vars.params), ...options?.mutation });
 }
 
-export const deletePersonaMapping = async (params: DeletePersonaMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {
+export const deletePersonaMapping = async (params: DeletePersonaMappingParams, options?: RequestInit): Promise<{ data: GroupResyncOut }> => {
   const res = await fetch(`/api/personas/mappings/${encodeURIComponent(String(params.mapping_id))}`, { ...options, method: "DELETE", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
   if (!res.ok) {
     const body = await res.text();
@@ -725,8 +1110,31 @@ export const deletePersonaMapping = async (params: DeletePersonaMappingParams, o
   return { data: await res.json() };
 };
 
-export function useDeletePersonaMapping(options?: { mutation?: UseMutationOptions<{ data: Record<string, unknown> }, ApiError, { params: DeletePersonaMappingParams }> }) {
+export function useDeletePersonaMapping(options?: { mutation?: UseMutationOptions<{ data: GroupResyncOut }, ApiError, { params: DeletePersonaMappingParams }> }) {
   return useMutation({ mutationFn: (vars) => deletePersonaMapping(vars.params), ...options?.mutation });
+}
+
+export const previewPersonaMappingRemoval = async (params: PreviewPersonaMappingRemovalParams, options?: RequestInit): Promise<{ data: GroupResyncPreviewOut }> => {
+  const res = await fetch(`/api/personas/mappings/${encodeURIComponent(String(params.mapping_id))}/removal-preview`, { ...options, method: "GET", headers: { ...(params?.["X-Forwarded-Access-Token"] != null && { "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"] }), ...options?.headers } });
+  if (!res.ok) {
+    const body = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(body); } catch { parsed = body; }
+    throw new ApiError(res.status, res.statusText, parsed);
+  }
+  return { data: await res.json() };
+};
+
+export const previewPersonaMappingRemovalKey = (params?: PreviewPersonaMappingRemovalParams) => {
+  return ["/api/personas/mappings/{mapping_id}/removal-preview", params] as const;
+};
+
+export function usePreviewPersonaMappingRemoval<TData = { data: GroupResyncPreviewOut }>(options: { params: PreviewPersonaMappingRemovalParams; query?: Omit<UseQueryOptions<{ data: GroupResyncPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useQuery({ queryKey: previewPersonaMappingRemovalKey(options.params), queryFn: () => previewPersonaMappingRemoval(options.params), ...options?.query });
+}
+
+export function usePreviewPersonaMappingRemovalSuspense<TData = { data: GroupResyncPreviewOut }>(options: { params: PreviewPersonaMappingRemovalParams; query?: Omit<UseSuspenseQueryOptions<{ data: GroupResyncPreviewOut }, ApiError, TData>, "queryKey" | "queryFn"> }) {
+  return useSuspenseQuery({ queryKey: previewPersonaMappingRemovalKey(options.params), queryFn: () => previewPersonaMappingRemoval(options.params), ...options?.query });
 }
 
 export const createPersonaUserMapping = async (data: PersonaUserMappingIn, params?: CreatePersonaUserMappingParams, options?: RequestInit): Promise<{ data: Record<string, unknown> }> => {

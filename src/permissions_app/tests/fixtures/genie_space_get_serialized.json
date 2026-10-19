@@ -1,0 +1,10 @@
+{
+  "create_time": "2026-10-09T10:00:30.522Z",
+  "etag": "0000000000",
+  "parent_path": "/Workspace/Users/someone@example.com",
+  "serialized_space": "{\"version\": 2, \"config\": {\"sample_questions\": [{\"id\": \"01f0000000000000000000000000q001\", \"question\": [\"What was revenue last week?\"]}]}, \"data_sources\": {\"tables\": [{\"identifier\": \"acme_catalog.sales.orders\", \"column_configs\": [{\"column_name\": \"order_id\", \"enable_format_assistance\": true}, {\"column_name\": \"region\", \"enable_format_assistance\": true}]}, {\"identifier\": \"acme_catalog.sales.v_daily_revenue\"}, {\"identifier\": \"acme_catalog.sales.customer_gold\"}, {\"identifier\": \"acme_catalog.finance.revenue_metrics\"}, {\"identifier\": \"acme_catalog.sales.dropped_table\"}], \"volumes\": [{\"path\": \"/Volumes/acme_catalog/sales/attachments/\"}]}, \"instructions\": {\"text_instructions\": [{\"id\": \"01f0000000000000000000000000t001\", \"content\": [\"Revenue is in USD.\"]}], \"example_question_sqls\": [{\"id\": \"01f0000000000000000000000000e001\", \"question\": [\"Revenue by region\"], \"sql\": [\"SELECT region, SUM(amount) FROM acme_catalog.sales.orders GROUP BY region\"]}], \"join_specs\": [{\"id\": \"01f0000000000000000000000000j001\", \"left\": {\"identifier\": \"acme_catalog.sales.orders\"}, \"right\": {\"identifier\": \"acme_catalog.sales.customer_gold\"}, \"sql\": [\"orders.customer_id = customer_gold.customer_id\"], \"comment\": [\"orders to customers\"]}]}, \"benchmarks\": {\"questions\": [{\"id\": \"01f0000000000000000000000000b001\", \"question\": [\"Top region?\"], \"answer\": [{\"format\": \"SQL\", \"content\": [\"SELECT 1\"]}]}]}}",
+  "space_id": "01f0000000000000000000000000abcd",
+  "title": "Sales Insights",
+  "update_time": "2026-10-09T10:00:38.788Z",
+  "warehouse_id": "0000000000000000"
+}

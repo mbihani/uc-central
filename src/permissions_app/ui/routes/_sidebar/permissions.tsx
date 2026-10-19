@@ -12,6 +12,8 @@ import {
   useUpdatePermissionMatrix,
   useApplyPermissions,
   useCheckPermissionConflicts,
+  useListResourcesByType,
+  useSetPermissionOverride,
   previewApplyPermissions,
   checkPermissionConflictsKey,
   getPermissionMatrixKey,
@@ -19,6 +21,7 @@ import {
   type ResourceType,
   type UserPermissionConflict,
   type ApplyPreviewOut,
+  type PermissionMatrixOut,
 } from "@/lib/api";
 import selector from "@/lib/selector";
 import {
@@ -340,6 +343,14 @@ function PermissionsContent() {
           toast.success(
             `Applied to ${data.total_resources_updated} resources${directPart}`,
           );
+        }
+        const added = data.table_grants_added ?? 0;
+        const revoked = data.table_grants_revoked ?? 0;
+        if (added || revoked) {
+          toast.info(`Genie table grants: ${added} added, ${revoked} revoked`);
+        }
+        for (const w of (data.warnings ?? []).slice(0, 3)) {
+          toast.warning(w);
         }
       },
       onError: (error) => {
@@ -749,6 +760,15 @@ function PermissionsContent() {
                                       {getPermissionLabel(level)}
                                     </Badge>
                                   )}
+                                  {(matrix.overridable_resource_types ?? []).includes(rt) && (
+                                    <PerSpaceOverrides
+                                      persona={p}
+                                      resourceType={rt}
+                                      allLevel={level}
+                                      matrix={matrix}
+                                      isAdmin={isAdmin}
+                                    />
+                                  )}
                                 </TableCell>
                               );
                             })}
@@ -770,7 +790,7 @@ function PermissionsContent() {
           if (!open) closeConfirm();
         }}
       >
-        <AlertDialogContent className="max-w-lg">
+        <AlertDialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
           <AlertDialogHeader>
             <AlertDialogTitle className="flex items-center gap-2">
               <Shield className="h-5 w-5" />
@@ -787,8 +807,11 @@ function PermissionsContent() {
                   ({previewData.groups.join(", ")})
                 </span>
               ) : null}{" "}
-              set to the persona's level. Deselect any type you do not want to
-              change. Nothing is written until you confirm.
+              set to its <span className="font-medium text-foreground">effective
+              level</span>: personas stack, so each group gets the highest level
+              any of its personas (or Genie access bundles) grants on each
+              object. Deselect any type you do not want to change. Nothing is
+              written until you confirm.
             </AlertDialogDescription>
           </AlertDialogHeader>
 
@@ -892,6 +915,11 @@ function PermissionsContent() {
                 </p>
               )}
 
+              <StackedPreviewDetail
+                preview={previewData}
+                selectedTypes={selectedTypes}
+              />
+
               {/* Direct-user re-sync count */}
               {(previewData.direct_user_count ?? 0) > 0 && (
                 <p className="text-xs text-muted-foreground flex items-center gap-1">
@@ -968,6 +996,297 @@ function PermissionsContent() {
           </ScrollArea>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+const INHERIT = "__all__";
+
+/** Per-space Genie levels for one persona: each space either follows the
+ * persona's "all spaces" cell or overrides it (higher OR lower). Nothing is
+ * written to the workspace until the persona is applied. */
+function PerSpaceOverrides({
+  persona,
+  resourceType,
+  allLevel,
+  matrix,
+  isAdmin,
+}: {
+  persona: string;
+  resourceType: string;
+  allLevel: string;
+  matrix: PermissionMatrixOut;
+  isAdmin: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
+  const overrides = (matrix.overrides ?? []).filter(
+    (o) => o.persona === persona && o.resource_type === resourceType,
+  );
+  const byId = new Map(overrides.map((o) => [o.resource_id, o.permission_level]));
+  const spaces = useListResourcesByType({
+    params: { resource_type: resourceType },
+    query: { enabled: open, staleTime: 60_000 },
+  });
+  const setOverride = useSetPermissionOverride({
+    mutation: {
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: getPermissionMatrixKey() });
+      },
+      onError: (error) => toast.error(`Failed to set per-space level: ${error.message}`),
+    },
+  });
+  const levels = matrix.allowed_permission_levels[resourceType] ?? [];
+  const label = matrix.persona_labels[persona] ?? persona;
+
+  return (
+    <>
+      <button
+        type="button"
+        className="mt-1 text-[11px] text-muted-foreground underline-offset-2 hover:underline disabled:no-underline"
+        onClick={() => setOpen(true)}
+        title="Override this level for individual Genie spaces"
+      >
+        {overrides.length > 0 ? `${overrides.length} per-space override${overrides.length !== 1 ? "s" : ""}` : "per space…"}
+      </button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle>{label}: Genie level per space</DialogTitle>
+            <DialogDescription>
+              By default every space gets this persona's "all spaces" level (
+              <strong>{getPermissionLabel(allLevel)}</strong>). Override it for
+              individual spaces — higher or lower; No Permissions means this
+              persona grants nothing there. Groups with several personas still
+              get the highest level any of them grants. Can View / Can Run or
+              higher also grants the group SELECT on the space's tables when the
+              persona is applied.
+            </DialogDescription>
+          </DialogHeader>
+          <ScrollArea className="flex-1 -mx-6 px-6">
+            {spaces.isLoading && (
+              <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading Genie spaces...
+              </div>
+            )}
+            {spaces.isError && (
+              <p className="py-6 text-sm text-destructive">Could not list Genie spaces.</p>
+            )}
+            <div className="space-y-1 pb-2">
+              {[
+                ...(spaces.data?.data ?? []),
+                // Overrides for spaces that are no longer listed stay visible.
+                ...overrides
+                  .filter((o) => !(spaces.data?.data ?? []).some((sp) => sp.id === o.resource_id))
+                  .map((o) => ({ id: o.resource_id, name: `${o.resource_id} (not listed)`, resource_type: resourceType })),
+              ].map((sp) => {
+                const value = byId.get(sp.id) ?? INHERIT;
+                return (
+                  <div key={sp.id} className="flex items-center justify-between gap-3 rounded border px-2 py-1.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{sp.name}</p>
+                      <p className="truncate text-[11px] text-muted-foreground font-mono">{sp.id}</p>
+                    </div>
+                    {isAdmin ? (
+                      <Select
+                        value={value}
+                        disabled={setOverride.isPending}
+                        onValueChange={(val) =>
+                          setOverride.mutate({
+                            params: {},
+                            data: {
+                              persona,
+                              resource_type: resourceType as ResourceType,
+                              resource_id: sp.id,
+                              permission_level:
+                                val === INHERIT
+                                  ? null
+                                  : (val as (typeof PermissionLevel)[keyof typeof PermissionLevel]),
+                            },
+                          })
+                        }
+                      >
+                        <SelectTrigger className={cn("h-8 w-56 text-xs", value !== INHERIT && getPermissionColor(value))}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={INHERIT}>
+                            All-spaces level ({getPermissionLabel(allLevel)})
+                          </SelectItem>
+                          {levels.map((pl) => (
+                            <SelectItem key={pl} value={pl}>
+                              {getPermissionLabel(pl)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <Badge variant="outline" className="text-xs">
+                        {value === INHERIT ? `All spaces (${getPermissionLabel(allLevel)})` : getPermissionLabel(value)}
+                      </Badge>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </ScrollArea>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+const GRANT_ACTION_STYLE: Record<string, string> = {
+  add: "bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/30",
+  present: "bg-muted text-muted-foreground",
+  keep: "bg-muted text-muted-foreground",
+  revoke: "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30",
+  release: "bg-muted text-muted-foreground",
+  error: "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30",
+};
+
+/** Least-privilege detail of the dry-run: per group/object effective level and
+ * who grants it, escalations, and the Genie table grants (add/keep/revoke). */
+function StackedPreviewDetail({
+  preview,
+  selectedTypes,
+}: {
+  preview: ApplyPreviewOut;
+  selectedTypes: Set<string>;
+}) {
+  const levels = (preview.group_levels ?? []).filter((l) => selectedTypes.has(l.resource_type));
+  const grants = selectedTypes.has("genie") ? preview.table_grants ?? [] : [];
+  const escalations = levels.filter((l) => l.escalation);
+  const warnings = preview.warnings ?? [];
+  if (!levels.length && !grants.length && !warnings.length) return null;
+  const counts = grants.reduce<Record<string, number>>((acc, g) => {
+    acc[g.action] = (acc[g.action] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  return (
+    <div className="space-y-3">
+      {escalations.length > 0 && (
+        <Alert className="border-amber-500/50 bg-amber-500/5">
+          <ArrowUp className="h-4 w-4 text-amber-600" />
+          <AlertTitle className="text-sm text-amber-700 dark:text-amber-400">
+            {escalations.length} escalation{escalations.length !== 1 ? "s" : ""} from stacking
+          </AlertTitle>
+          <AlertDescription className="text-xs space-y-0.5">
+            {escalations.map((l) => (
+              <p key={`${l.group_id}:${l.resource_type}:${l.resource_id ?? "*"}`}>
+                <strong>{l.group_name}</strong> · {l.resource_type_label}
+                {l.resource_name ? ` · ${l.resource_name}` : ""}: {l.escalation_detail}
+              </p>
+            ))}
+          </AlertDescription>
+        </Alert>
+      )}
+      {warnings.length > 0 && (
+        <div className="space-y-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
+          {warnings.map((w) => (
+            <p key={w} className="flex gap-1.5">
+              <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0 text-amber-600" />
+              {w}
+            </p>
+          ))}
+        </div>
+      )}
+      {levels.length > 0 && (
+        <details className="rounded-md border" open={levels.length <= 12}>
+          <summary className="cursor-pointer px-3 py-2 text-sm font-medium">
+            Effective access per group ({levels.length})
+          </summary>
+          <div className="max-h-64 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/50 text-left sticky top-0">
+                <tr>
+                  <th className="p-1.5">Group</th>
+                  <th className="p-1.5">Object</th>
+                  <th className="p-1.5">Effective</th>
+                  <th className="p-1.5">Given by</th>
+                  <th className="p-1.5">All sources</th>
+                </tr>
+              </thead>
+              <tbody>
+                {levels.map((l) => (
+                  <tr
+                    key={`${l.group_id}:${l.resource_type}:${l.resource_id ?? "*"}`}
+                    className={cn("border-t", l.escalation && "bg-amber-500/5")}
+                  >
+                    <td className="p-1.5 font-medium">{l.group_name}</td>
+                    <td className="p-1.5">
+                      {l.resource_type_label}
+                      {l.resource_name ? ` · ${l.resource_name}` : l.resource_id ? "" : " (all)"}
+                    </td>
+                    <td className="p-1.5">
+                      {l.blocked ? (
+                        <span className="text-destructive" title={l.blocked}>not changed</span>
+                      ) : (
+                        <Badge variant="outline" className={cn("text-[10px]", getPermissionColor(l.effective_level))}>
+                          {getPermissionLabel(l.effective_level)}
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="p-1.5">{(l.granted_by ?? []).join(", ") || "—"}</td>
+                    <td className="p-1.5 text-muted-foreground">
+                      {Object.entries(l.source_levels ?? {})
+                        .map(([src, lvl]) => `${src}: ${getPermissionLabel(lvl)}`)
+                        .join("; ")}
+                      {l.blocked ? <span className="block text-destructive">{l.blocked}</span> : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+      {grants.length > 0 && (
+        <details className="rounded-md border" open>
+          <summary className="cursor-pointer px-3 py-2 text-sm font-medium">
+            Genie table grants — {Object.entries(counts).map(([a, n]) => `${n} ${a}`).join(", ")}
+          </summary>
+          <div className="max-h-64 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/50 text-left sticky top-0">
+                <tr>
+                  <th className="p-1.5">Group</th>
+                  <th className="p-1.5">Space</th>
+                  <th className="p-1.5">Grant</th>
+                  <th className="p-1.5">Action</th>
+                  <th className="p-1.5">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {grants.map((g) => (
+                  <tr key={`${g.group_id}:${g.source}:${g.securable_type}:${g.full_name}:${g.privilege}`} className="border-t">
+                    <td className="p-1.5 font-medium">{g.group_name}</td>
+                    <td className="p-1.5">{g.space_title || g.space_id}</td>
+                    <td className="p-1.5 font-mono">
+                      {g.privilege} on {g.securable_type} {g.full_name}
+                    </td>
+                    <td className="p-1.5">
+                      <Badge variant="outline" className={cn("text-[10px]", GRANT_ACTION_STYLE[g.action])}>
+                        {g.action}
+                      </Badge>
+                    </td>
+                    <td className="p-1.5 text-muted-foreground">
+                      {g.has_row_filter && <Badge variant="outline" className="mr-1 text-[10px]">row filter</Badge>}
+                      {(g.masked_columns ?? []).length > 0 && (
+                        <Badge variant="outline" className="mr-1 text-[10px]">
+                          masked: {(g.masked_columns ?? []).join(", ")}
+                        </Badge>
+                      )}
+                      {g.detail}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
     </div>
   );
 }

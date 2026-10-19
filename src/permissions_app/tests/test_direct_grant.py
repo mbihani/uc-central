@@ -28,6 +28,19 @@ from permissions_app.backend.router import (
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _no_group_operation_locks():
+    """These tests drive Apply with a MagicMock session, which cannot hold the
+    real group operation locks (covered in test_persona_stacking)."""
+    from contextlib import nullcontext
+
+    with patch(
+        "permissions_app.backend.router.operation_locks",
+        side_effect=lambda *_a, **_k: nullcontext(),
+    ):
+        yield
+
+
 def _make_resource(rid, name="res"):
     return SimpleNamespace(id=rid, name=name)
 
@@ -159,6 +172,21 @@ def test_genie_space_apply_pushes_group_acl_with_genie_object_type():
     mock_session = MagicMock()
     mock_session.exec.side_effect = fake_session_exec
     mock_ws = MagicMock()
+    # Genie access now always comes with the space's table grants, which UC can
+    # only give an ACCOUNT group — so the group is resolved by id first.
+    from databricks.sdk.service import iam
+    from permissions_app.backend.genie_bundles import SpaceDiscovery
+    from permissions_app.backend.models import GenieSpaceObjectOut
+
+    mock_ws.groups.get.return_value = iam.Group(
+        id="g1", display_name="AnalystGroup", meta=iam.ResourceMeta(resource_type="Group")
+    )
+    discovery = SpaceDiscovery(
+        space_id="01f0genie",
+        title="FSI Genie Space",
+        objects=[GenieSpaceObjectOut(kind="table", identifier="c.s.t", full_name="c.s.t", resolved=True)],
+    )
+    tables_result = MagicMock(granted=[], revoked=[], errors=[], warnings=[])
 
     with (
         patch(
@@ -167,6 +195,12 @@ def test_genie_space_apply_pushes_group_acl_with_genie_object_type():
         ),
         patch("permissions_app.backend.router.apply_group_acl") as mock_group_acl,
         patch("permissions_app.backend.router.apply_user_acl") as mock_user_acl,
+        patch("permissions_app.backend.persona_sync.discover_space", return_value=discovery),
+        patch(
+            "permissions_app.backend.router.execute_genie_table_grants",
+            return_value=tables_result,
+        ) as mock_tables,
+        patch("permissions_app.backend.router.release_stale_table_grants"),
     ):
         result = apply_permissions(
             persona=persona,
@@ -177,6 +211,10 @@ def test_genie_space_apply_pushes_group_acl_with_genie_object_type():
     mock_group_acl.assert_called_once_with(
         mock_ws, "genie", "01f0genie", {"AnalystGroup": level}
     )
+    # ...and the table grants were planned for this persona as the source.
+    (genie_plan,) = [e for e in mock_tables.call_args.args[2].entries]
+    assert [src.key for src in genie_plan.sources] == ["persona:analyst:space:01f0genie"]
+    assert [k.full_name for k in genie_plan.keys] == ["c", "c.s", "c.s.t"]
     mock_user_acl.assert_not_called()
     assert result.total_resources_updated == 1
     assert result.total_errors == 0

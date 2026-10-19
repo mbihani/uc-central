@@ -7,6 +7,7 @@ import {
   UserCog,
   Shield,
   Database,
+  Sparkles,
   User,
 } from "lucide-react";
 import {
@@ -48,6 +49,12 @@ function Layout() {
       label: "Permissions Matrix",
       icon: <Shield size={16} />,
       match: (path: string) => path === "/permissions",
+    },
+    {
+      to: "/genie-bundles",
+      label: "Genie Access",
+      icon: <Sparkles size={16} />,
+      match: (path: string) => path === "/genie-bundles",
     },
     {
       to: "/resources",

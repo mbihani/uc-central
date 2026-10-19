@@ -132,6 +132,14 @@ def get_current_user(user_ws: UserWsDep) -> User:
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
 
 
+def get_actor(user: CurrentUserDep) -> str:
+    """The request user's name, recorded as ``granted_by`` on ledger rows."""
+    return user.user_name or ""
+
+
+ActorDep = Annotated[str, Depends(get_actor)]
+
+
 def get_session(rt: RuntimeDep) -> Generator[Session, None, None]:
     """
     Returns a SQLModel session.

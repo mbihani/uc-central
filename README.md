@@ -68,7 +68,8 @@ databricks bundle deploy -t dev
 See **[DEPLOYMENT.md](./DEPLOYMENT.md)** for the full deployment guide
 (prerequisites, step-by-step procedure, troubleshooting, and the manual
 fallback path). See **[MANIFESTO.md](./MANIFESTO.md)** for every configurable
-value in the project.
+value in the project. See **[docs/genie-access-bundles.md](./docs/genie-access-bundles.md)**
+for Genie access bundles (per-space account group + per-table UC grants).
 
 ---
 
