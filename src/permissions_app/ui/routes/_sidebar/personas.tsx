@@ -1005,6 +1005,11 @@ function DeletePersonaDialog({
   persona: PersonaOut;
   onDeleted: () => void;
 }) {
+  // Directly assigned users (not group-derived members) whose per-user ACLs
+  // the delete recomputes.
+  const directUsers = (persona.users ?? []).filter(
+    (u) => u.assignment_type === "direct" || u.assignment_type === "both",
+  );
   const deletePersonaMutation = useDeletePersona({
     mutation: {
       onSuccess: ({ data }) => {
@@ -1038,12 +1043,22 @@ function DeletePersonaDialog({
                   {persona.groups.length !== 1 ? "s" : ""}
                 </li>
               )}
+              {directUsers.length > 0 && (
+                <li>
+                  {directUsers.length} direct user
+                  {directUsers.length !== 1 ? "s" : ""}:{" "}
+                  {directUsers.map((u) => u.display_name || u.user_name).join(", ")}{" "}
+                  — each user's per-user ACLs are recomputed without this persona
+                  (kept where another of their personas still grants access)
+                </li>
+              )}
               <li>All associated permission templates and per-space levels</li>
             </ul>
             <span className="block mt-2">
-              Each mapped group is first recomputed without this persona (the
-              persona is deleted only if every group's cleanup succeeds; otherwise
-              it is kept so you can retry):
+              Each mapped group and direct user is first recomputed without this
+              persona (the persona is deleted only if every group's AND user's
+              cleanup succeeds; otherwise it and the failed mappings are kept so
+              you can retry):
               access only this persona gave is removed, and Genie table grants
               it needed are revoked unless another persona or bundle still needs
               them (pre-existing grants are never revoked).

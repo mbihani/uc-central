@@ -754,10 +754,14 @@ def delete_persona(
     """Delete a persona and all its associated mappings and permission templates.
 
     Every group the persona is mapped to is first RECOMPUTED without it, exactly
-    like removing the mapping (see ``_remove_group_persona``). A mapping is
-    deleted only once its group's cleanup succeeded; if any group's cleanup
-    fails, that mapping AND the persona (templates, overrides, user mappings)
-    are kept and the errors are returned, so the delete can simply be retried.
+    like removing the mapping (see ``_remove_group_persona``), and every direct
+    user's per-user ACLs are recomputed without it, exactly like
+    ``remove_persona_member`` (``_revoke_direct_user``). Each mapping (group or
+    user) is deleted only once its own cleanup succeeded; the persona
+    (templates, overrides, definition) only once ALL of them did. Otherwise
+    the failed mappings and the persona are kept and the errors returned, so
+    the delete can simply be retried. All under the persona lock (order
+    persona -> group -> grant; user cleanup takes no further locks).
     """
     if not session.exec(
         select(PersonaDefinition).where(PersonaDefinition.key == persona_key)
@@ -788,25 +792,37 @@ def delete_persona(
                 _remove_group_persona(obo_ws, session, m, refs[m.group_id], actor)
                 for m in mappings
             ]
-        if not all(r.mapping_removed for r in resynced) or mapped():
-            # A failed cleanup keeps its mapping; ``mapped()`` is also a
+        # Direct users: the SAME cleanup as remove_persona_member, per user;
+        # each mapping is deleted only after that user's ACLs were recomputed.
+        users: list[dict] = []
+        for um in session.exec(
+            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
+        ).all():
+            name = um.user_name
+            errs = _revoke_direct_user(obo_ws, session, persona_key, um)
+            users.append({"user_name": name, "removed": not errs, "errors": errs})
+        users_left = session.exec(
+            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
+        ).all()
+
+        failed_groups = sum(not r.mapping_removed for r in resynced)
+        if failed_groups or mapped() or users_left:
+            # Failed cleanups keep their mappings (group or user) and the
+            # persona, so a retry finishes the job. ``mapped()`` is also a
             # belt-and-braces check (creation is excluded by the persona lock).
             return {
                 "status": "incomplete",
                 "persona_deleted": False,
                 "message": (
                     f"Persona '{persona_key}' was NOT deleted: cleanup failed for "
-                    f"{sum(not r.mapping_removed for r in resynced)} group(s); their "
-                    f"mappings were kept. Fix the errors and retry."
+                    f"{failed_groups} group(s) and {len(users_left)} direct user(s); "
+                    f"their mappings were kept. Fix the errors and retry."
                 ),
                 "groups_recomputed": [r.model_dump() for r in resynced],
+                "users_recomputed": users,
             }
 
         _before_persona_delete_commit()
-        for um in session.exec(
-            select(PersonaUserMapping).where(PersonaUserMapping.persona == persona_key)
-        ).all():
-            session.delete(um)
         for t in session.exec(
             select(PermissionTemplate).where(PermissionTemplate.persona == persona_key)
         ).all():
@@ -823,6 +839,7 @@ def delete_persona(
         "persona_deleted": True,
         "message": f"Persona '{persona_key}' deleted",
         "groups_recomputed": [r.model_dump() for r in resynced],
+        "users_recomputed": users,
     }
 
 
@@ -1426,24 +1443,8 @@ def _remove_persona_member_locked(
             ),
         )
 
-    # ACL revoke FIRST, DB delete only on success.
-    # Rationale: if we delete the row first and the ACL write fails, the mapping
-    # is gone — a retry returns 404 and Apply won't find the user either, leaving
-    # a stale per-user ACL grant with no recovery path. By doing the ACL write
-    # first we keep the row intact on failure so the caller can retry or Apply.
-    templates = session.exec(
-        select(PermissionTemplate).where(PermissionTemplate.persona == persona)
-    ).all()
-
-    _, acl_errors = _sync_direct_user_acl(
-        obo_ws, session, user_name, templates, exclude_persona=persona
-    )
-
+    acl_errors = _revoke_direct_user(obo_ws, session, persona, mapping)
     if acl_errors:
-        logger.error(
-            f"Direct-remove of user {user_name} from persona '{persona}': "
-            f"{len(acl_errors)} ACL error(s): {acl_errors}"
-        )
         raise HTTPException(
             status_code=502,
             detail=(
@@ -1452,10 +1453,6 @@ def _remove_persona_member_locked(
                 f"Errors: {acl_errors}"
             ),
         )
-
-    # ACL writes succeeded — now safe to delete the mapping row.
-    session.delete(mapping)
-    session.commit()
 
     return {
         "status": "ok",
@@ -1467,6 +1464,41 @@ def _remove_persona_member_locked(
             f"Group membership was NOT changed."
         ),
     }
+
+
+def _revoke_direct_user(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    persona: str,
+    mapping: PersonaUserMapping,
+) -> list[str]:
+    """Remove ONE direct-user assignment: recompute the user's per-user ACLs
+    WITHOUT ``persona`` (highest of their remaining direct personas; entry
+    removed where none grants anything), then delete the mapping row — only if
+    every ACL write succeeded. Returns the errors (mapping kept when non-empty).
+    Shared by ``remove_persona_member`` and persona delete; the caller holds
+    the persona lock.
+
+    ACL revoke FIRST, DB delete only on success: if the row were deleted first
+    and an ACL write failed, a retry would 404 and Apply would not find the
+    user either, leaving a stale per-user grant with no recovery path.
+    """
+    user_name = mapping.user_name
+    templates = session.exec(
+        select(PermissionTemplate).where(PermissionTemplate.persona == persona)
+    ).all()
+    _, acl_errors = _sync_direct_user_acl(
+        obo_ws, session, user_name, templates, exclude_persona=persona
+    )
+    if acl_errors:
+        logger.error(
+            f"Direct-remove of user {user_name} from persona '{persona}': "
+            f"{len(acl_errors)} ACL error(s): {acl_errors}"
+        )
+        return acl_errors
+    session.delete(mapping)
+    session.commit()
+    return []
 
 
 # ─── Permissions Matrix (DB-backed) ──────────────────────────────────────────

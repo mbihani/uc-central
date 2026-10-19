@@ -1082,3 +1082,86 @@ def test_persona_keyed_writes_cannot_race_persona_delete_postgres(ws, monkeypatc
         assert _persona_rows(s, "sales_analyst") == []  # nothing orphaned or resurrected
     SQLModel.metadata.drop_all(engine)
     engine.dispose()
+
+
+# ═══ Review round 6: persona delete cleans up DIRECT users too ═══
+
+ANN, BOB = "ann@example.com", "bob@example.com"
+
+
+def _direct(session, persona, user, uid):
+    from permissions_app.backend.models import PersonaUserMapping
+
+    session.add(PersonaUserMapping(user_id=uid, user_name=user, display_name=user, persona=persona))
+    session.commit()
+
+
+def _user_level(ws, space, user):
+    return ws.space_acl.get(space, {}).get(("user", user))
+
+
+def _direct_users_setup(session, ws):
+    """p_run gives CAN_RUN on every Genie space, p_read CAN_READ. Ann holds
+    both, Bob only p_run; their per-user ACLs were applied earlier."""
+    _persona(session, "p_run", {GENIE: CAN_RUN})
+    _persona(session, "p_read", {GENIE: CAN_READ})
+    _direct(session, "p_run", ANN, "1")
+    _direct(session, "p_read", ANN, "1")
+    _direct(session, "p_run", BOB, "2")
+    for space in (SALES, HR):
+        ws.space_acl[space][("user", ANN)] = CAN_RUN
+        ws.space_acl[space][("user", BOB)] = CAN_RUN
+
+
+def _user_mappings(session, persona):
+    from permissions_app.backend.models import PersonaUserMapping
+
+    return sorted(m.user_name for m in session.exec(select(PersonaUserMapping).where(PersonaUserMapping.persona == persona)).all())
+
+
+def test_persona_delete_revokes_direct_users_acls_highest_wins(session, ws):
+    _direct_users_setup(session, ws)
+
+    out = delete_persona("p_run", ws, session, "admin")
+
+    assert out["status"] == "ok" and out["persona_deleted"], out
+    assert {u["user_name"] for u in out["users_recomputed"]} == {ANN, BOB}
+    for space in (SALES, HR):
+        assert _user_level(ws, space, ANN) == CAN_READ  # p_read still grants it
+        assert _user_level(ws, space, BOB) is None  # nothing else: revoked
+    assert _user_mappings(session, "p_run") == []
+    assert _user_mappings(session, "p_read") == [ANN]  # other persona untouched
+
+
+def test_failed_direct_user_cleanup_keeps_mapping_and_persona_then_retry(session, ws):
+    _direct_users_setup(session, ws)
+    real_set = ws.permissions.set
+    failing = {"on": True}
+
+    def set_failing_for_bob(request_object_type, request_object_id, access_control_list):
+        names = {r.user_name for r in access_control_list if r.user_name}
+        if failing["on"] and ("user", BOB) in ws.space_acl.get(request_object_id, {}) and BOB not in names:
+            from databricks.sdk.errors import PermissionDenied
+
+            raise PermissionDenied("cannot change Bob's entry")
+        return real_set(request_object_type, request_object_id, access_control_list)
+
+    ws.permissions = SimpleNamespace(get=ws.permissions.get, set=set_failing_for_bob)
+
+    out = delete_persona("p_run", ws, session, "admin")
+
+    assert out["status"] == "incomplete" and not out["persona_deleted"]
+    by_user = {u["user_name"]: u for u in out["users_recomputed"]}
+    assert by_user[ANN]["removed"] and not by_user[BOB]["removed"] and by_user[BOB]["errors"]
+    assert _user_mappings(session, "p_run") == [BOB]  # only the failed one kept
+    assert session.exec(select(PersonaDefinition).where(PersonaDefinition.key == "p_run")).first() is not None
+    assert session.exec(select(PermissionTemplate).where(PermissionTemplate.persona == "p_run")).all()
+    assert _user_level(ws, SALES, BOB) == CAN_RUN
+
+    failing["on"] = False
+    again = delete_persona("p_run", ws, session, "admin")
+
+    assert again["status"] == "ok" and again["persona_deleted"]
+    assert _user_mappings(session, "p_run") == []
+    assert _user_level(ws, SALES, BOB) is None and _user_level(ws, HR, BOB) is None
+    assert _user_level(ws, SALES, ANN) == CAN_READ

@@ -375,9 +375,15 @@ bundle or pre-existing grant keeps them. The mapping is deleted **only if the
 cleanup fully succeeded** (no ACL / UC error, and no ledger row of that persona
 left for the group). Otherwise it is kept, the response has
 `mapping_removed: false` plus the errors, and calling the removal again retries
-it. Deleting a persona works the same way per group; the persona (templates,
-overrides, user mappings) is deleted only once every group's cleanup has
-succeeded. A removal preview (`GET /api/personas/mappings/{id}/removal-preview`)
+it. Deleting a persona works the same way per group. It also cleans up every
+**directly assigned user** exactly like removing that user from the persona:
+the user's per-user ACLs are recomputed without the persona (kept at the
+highest level their remaining direct personas grant, removed where none
+does), and the user's mapping is deleted only after that succeeded. The
+persona (templates, overrides, definition) is deleted only once **every**
+group's and user's cleanup has succeeded; otherwise it and the failed mappings
+are kept (`status: "incomplete"`, errors per group / user) and a retry
+finishes the job. The delete dialog lists the direct users affected. A removal preview (`GET /api/personas/mappings/{id}/removal-preview`)
 shows the result first and writes nothing.
 
 **Removal recomputes every persona-managed type, which can undo Resources-page
