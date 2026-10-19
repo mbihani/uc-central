@@ -962,3 +962,123 @@ def test_operation_lock_order_is_enforced(session):
             with gb.operation_locks(session, personas=["p"]):
                 pass
     assert session.info[gb._HELD_OP_LOCKS] == []
+
+
+# ═══ Review round 5: every persona-keyed write takes the persona lock ═══
+
+
+def _persona_rows(s, key):
+    """Every row that references persona ``key``, across all persona tables."""
+    from permissions_app.backend.models import PersonaUserMapping
+
+    out = []
+    for model in (PersonaDefinition, PersonaGroupMapping, PersonaUserMapping, PermissionTemplate, PersonaResourceOverride):
+        col_ = model.key if model is PersonaDefinition else model.persona
+        out += [f"{model.__tablename__}:{getattr(r, 'id', '?')}" for r in s.exec(select(model).where(col_ == key)).all()]
+    out += [f"genie_grant_ledger:{r.id}" for r in s.exec(select(GenieGrantLedger).where(GenieGrantLedger.persona == key)).all()]
+    return out
+
+
+def _write_user_mapping(ws, s):
+    from permissions_app.backend.models import PersonaUserMappingIn
+    from permissions_app.backend.router import create_persona_user_mapping
+
+    return create_persona_user_mapping(
+        PersonaUserMappingIn(user_id="42", user_name="ann@example.com", display_name="Ann", persona="sales_analyst"),
+        ws, s,
+    )
+
+
+def _write_override(ws, s):
+    return set_permission_override(
+        PermissionOverrideIn(persona="sales_analyst", resource_type=ResourceType.GENIE_SPACES,
+                             resource_id=HR, permission_level=PermissionLevel.CAN_RUN),
+        s,
+    )
+
+
+def _write_matrix_cell(ws, s):
+    from permissions_app.backend.models import PermissionMatrixCell
+    from permissions_app.backend.router import update_permission_matrix
+
+    return update_permission_matrix(
+        PermissionMatrixCell(persona="sales_analyst", resource_type=ResourceType.CLUSTERS,
+                             permission_level=PermissionLevel.CAN_RESTART),
+        s,
+    )
+
+
+def _write_persona_update(ws, s):
+    from permissions_app.backend.models import PersonaDefinitionUpdateIn
+    from permissions_app.backend.router import update_persona
+
+    return update_persona("sales_analyst", PersonaDefinitionUpdateIn(label="Renamed"), s)
+
+
+def _write_matrix_backfill(ws, s):
+    from permissions_app.backend.router import get_permission_matrix
+
+    return get_permission_matrix(s)  # backfills the persona's missing cells
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+@pytest.mark.parametrize(
+    "write",
+    [_write_user_mapping, _write_override, _write_matrix_cell, _write_persona_update, _write_matrix_backfill],
+    ids=["user-mapping", "override", "matrix-cell", "persona-update", "matrix-backfill"],
+)
+def test_persona_keyed_writes_cannot_race_persona_delete_postgres(ws, monkeypatch, write):
+    import threading
+
+    from permissions_app.backend import router
+
+    engine = create_engine(PG_URL or "")
+    _pg_setup(engine)
+    with Session(engine) as s:
+        apply_permissions("sales_analyst", ws, s, None, "admin")
+        # Give the backfill something to (wrongly) re-create.
+        cell = s.exec(select(PermissionTemplate).where(
+            PermissionTemplate.persona == "sales_analyst", PermissionTemplate.resource_type == CLUSTERS
+        )).first()
+        if cell is not None:
+            s.delete(cell)
+            s.commit()
+    paused, go = threading.Event(), threading.Event()
+
+    def pause():
+        paused.set()
+        assert go.wait(20)
+
+    monkeypatch.setattr(router, "_before_persona_delete_commit", pause)
+    results: dict = {}
+    errors: list[str] = []
+
+    def run(name, fn):
+        try:
+            with Session(engine) as s:
+                results[name] = fn(s)
+        except HTTPException as e:
+            results[name] = e
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t_del = threading.Thread(target=run, args=("delete", lambda s: delete_persona("sales_analyst", ws, s, "admin")))
+    t_del.start()
+    assert paused.wait(20)
+    t_w = threading.Thread(target=run, args=("write", lambda s: write(ws, s)))
+    t_w.start()
+    t_w.join(1.0)
+    assert t_w.is_alive(), "the persona-keyed write did not wait for the persona delete"
+    go.set()
+    t_del.join(30)
+    t_w.join(30)
+
+    assert errors == [], errors
+    assert results["delete"]["persona_deleted"] is True
+    if write is not _write_matrix_backfill:  # the backfill just skips the persona
+        assert isinstance(results["write"], HTTPException), results["write"]
+        assert results["write"].status_code in (400, 404)
+    with Session(engine) as s:
+        assert _persona_rows(s, "sales_analyst") == []  # nothing orphaned or resurrected
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()

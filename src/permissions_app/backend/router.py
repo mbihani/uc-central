@@ -1,5 +1,7 @@
 from collections.abc import Sequence
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Annotated
 
 from databricks.sdk import WorkspaceClient
@@ -91,7 +93,7 @@ from .persona_sync import (
     table_grant_rows,
 )
 from .resources import SUPPORTED_ACL_RESOURCE_TYPES, apply_group_acl, apply_user_acl, list_resources
-from .seed import seed_permission_templates, seed_persona_definitions
+from .seed import default_permission_template_rows, seed_persona_definitions
 from .utils import raise_internal_error
 
 api = APIRouter(prefix=api_prefix)
@@ -435,6 +437,50 @@ def list_unassigned_users(
 # ─── Personas (DB-backed) ────────────────────────────────────────────────────
 
 
+@contextmanager
+def _persona_write(session: Session, persona: str, *, missing_status: int = 404) -> Iterator[PersonaDefinition]:
+    """Every write keyed by a persona runs under its PERSONA operation lock
+    (the one persona delete holds through its final commit) and re-checks
+    the persona exists UNDER the lock, so nothing can be written for a persona
+    that is being — or has been — deleted. Lock order persona -> group ->
+    grant (see ``genie_bundles.operation_locks``)."""
+    with operation_locks(session, personas=[persona]):
+        defn = session.exec(
+            select(PersonaDefinition)
+            .where(PersonaDefinition.key == persona)
+            .execution_options(populate_existing=True)
+        ).first()
+        if not defn:
+            raise HTTPException(
+                status_code=missing_status,
+                detail=f"Persona '{persona}' does not exist.",
+            )
+        yield defn
+
+
+def _insert_template_rows(session: Session, rows: list[dict]) -> None:
+    """Insert matrix cells (ON CONFLICT DO NOTHING) only for personas that
+    still exist, checked under their persona locks — the lazy seed / backfill
+    must never (re)create cells for a deleted persona."""
+    personas = sorted({r["persona"] for r in rows})
+    if not personas:
+        return
+    with operation_locks(session, personas=personas):
+        alive = set(
+            session.exec(
+                select(PersonaDefinition.key).where(col(PersonaDefinition.key).in_(personas))
+            ).all()
+        )
+        keep = [r for r in rows if r["persona"] in alive]
+        if keep:
+            session.execute(
+                pg_insert(PermissionTemplate.__table__)
+                .values(keep)
+                .on_conflict_do_nothing(index_elements=["persona", "resource_type"])
+            )
+        session.commit()
+
+
 def _seed_persona_definitions(session: Session):
     """Seed default persona definitions (idempotent upsert; see backend.seed).
 
@@ -618,44 +664,47 @@ def create_persona(body: PersonaDefinitionIn, session: SessionDep, _admin: Admin
             detail="Persona key must start with a letter and contain only lowercase letters, numbers, and underscores.",
         )
 
-    # Check uniqueness
-    existing = session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == body.key)
-    ).first()
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"A persona with key '{body.key}' already exists.",
-        )
-
-    defn = PersonaDefinition(
-        key=body.key,
-        label=body.label,
-        description=body.description,
-        is_default=False,
-    )
-    session.add(defn)
-    session.commit()
-    session.refresh(defn)
-
-    # Seed NO_PERMISSIONS for all resource types so the persona shows in the matrix
-    for rt in ResourceType:
-        session.add(
-            PermissionTemplate(
-                persona=defn.key,
-                resource_type=rt.value,
-                permission_level=PermissionLevel.NO_PERMISSIONS.value,
+    # Under the persona lock of the NEW key: never interleaves with a delete of
+    # the same key (see _persona_write).
+    with operation_locks(session, personas=[body.key]):
+        # Check uniqueness
+        existing = session.exec(
+            select(PersonaDefinition).where(PersonaDefinition.key == body.key)
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A persona with key '{body.key}' already exists.",
             )
-        )
-    session.commit()
 
-    return PersonaDefinitionOut(
-        id=defn.id,  # type: ignore
-        key=defn.key,
-        label=defn.label,
-        description=defn.description,
-        is_default=defn.is_default,
-    )
+        defn = PersonaDefinition(
+            key=body.key,
+            label=body.label,
+            description=body.description,
+            is_default=False,
+        )
+        session.add(defn)
+        session.commit()
+        session.refresh(defn)
+
+        # Seed NO_PERMISSIONS for all resource types so the persona shows in the matrix
+        for rt in ResourceType:
+            session.add(
+                PermissionTemplate(
+                    persona=defn.key,
+                    resource_type=rt.value,
+                    permission_level=PermissionLevel.NO_PERMISSIONS.value,
+                )
+            )
+        session.commit()
+
+        return PersonaDefinitionOut(
+            id=defn.id,  # type: ignore
+            key=defn.key,
+            label=defn.label,
+            description=defn.description,
+            is_default=defn.is_default,
+        )
 
 
 @api.put(
@@ -665,12 +714,13 @@ def create_persona(body: PersonaDefinitionIn, session: SessionDep, _admin: Admin
 )
 def update_persona(persona_key: str, body: PersonaDefinitionUpdateIn, session: SessionDep, _admin: AdminRequired = True):
     """Update a persona's label and/or description."""
-    defn = session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == persona_key)
-    ).first()
-    if not defn:
-        raise HTTPException(status_code=404, detail="Persona not found")
+    with _persona_write(session, persona_key) as defn:
+        return _update_persona_locked(session, defn, body)
 
+
+def _update_persona_locked(
+    session: Session, defn: PersonaDefinition, body: PersonaDefinitionUpdateIn
+) -> PersonaDefinitionOut:
     if body.label is not None:
         defn.label = body.label
     if body.description is not None:
@@ -1259,16 +1309,18 @@ def create_persona_user_mapping(
     _assert_valid_principal_id(body.user_id)
     _assert_valid_principal_id(body.user_name)
 
-    # Validate persona exists
-    persona_def = session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == body.persona)
-    ).first()
-    if not persona_def:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Persona '{body.persona}' does not exist.",
-        )
+    # Persona lock + existence re-check, held through the row upsert and the
+    # per-user ACL writes (persona -> no group / grant locks).
+    with _persona_write(session, body.persona, missing_status=400) as persona_def:
+        return _create_persona_user_mapping_locked(obo_ws, session, body, persona_def)
 
+
+def _create_persona_user_mapping_locked(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    body: PersonaUserMappingIn,
+    persona_def: PersonaDefinition,
+) -> dict:
     # Upsert the PersonaUserMapping row race-safely via ON CONFLICT DO NOTHING.
     # The UNIQUE(persona, user_name) constraint turns a concurrent duplicate add
     # into a clean no-op rather than a 500 IntegrityError.
@@ -1348,12 +1400,17 @@ def remove_persona_member(
     """
     _assert_valid_principal_id(user_name)
 
-    persona_def = session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == persona)
-    ).first()
-    if not persona_def:
-        raise HTTPException(status_code=404, detail=f"Persona '{persona}' not found")
+    with _persona_write(session, persona) as persona_def:
+        return _remove_persona_member_locked(obo_ws, session, persona, user_name, persona_def)
 
+
+def _remove_persona_member_locked(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    persona: str,
+    user_name: str,
+    persona_def: PersonaDefinition,
+) -> dict:
     mapping = session.exec(
         select(PersonaUserMapping).where(
             PersonaUserMapping.persona == persona,
@@ -1455,13 +1512,9 @@ def get_permission_matrix(session: SessionDep, _admin: AdminRequired = True):
         if (d.key, rt.value) not in existing_cells
     ]
     if missing_rows:
-        session.execute(
-            pg_insert(PermissionTemplate.__table__)
-            .values(missing_rows)
-            .on_conflict_do_nothing(index_elements=["persona", "resource_type"])
-        )
-        session.commit()
+        _insert_template_rows(session, missing_rows)
         templates = session.exec(select(PermissionTemplate)).all()
+        definitions = session.exec(select(PersonaDefinition)).all()
 
     matrix = [
         PermissionTemplateOut(
@@ -1525,10 +1578,13 @@ def set_permission_override(
         )
     if not body.resource_id.strip():
         raise HTTPException(status_code=400, detail="resource_id is required.")
-    if not session.exec(
-        select(PersonaDefinition).where(PersonaDefinition.key == body.persona)
-    ).first():
-        raise HTTPException(status_code=404, detail=f"Persona '{body.persona}' not found")
+    with _persona_write(session, body.persona):
+        return _set_override_locked(session, body, rt)
+
+
+def _set_override_locked(
+    session: Session, body: PermissionOverrideIn, rt: str
+) -> list[PermissionOverrideOut]:
     existing = session.exec(
         select(PersonaResourceOverride).where(
             PersonaResourceOverride.persona == body.persona,
@@ -1569,7 +1625,11 @@ def update_permission_matrix(body: PermissionMatrixCell, session: SessionDep, _a
     # support (e.g. CAN_MANAGE on a cluster-policy). Reject with a 400 before the
     # DB write; NO_PERMISSIONS is always allowed.
     _assert_level_allowed(body.resource_type.value, body.permission_level.value)
+    with _persona_write(session, body.persona):
+        return _update_cell_locked(session, body)
 
+
+def _update_cell_locked(session: Session, body: PermissionMatrixCell) -> PermissionTemplateOut:
     template = session.exec(
         select(PermissionTemplate).where(
             PermissionTemplate.persona == body.persona,
@@ -2353,6 +2413,8 @@ def _seed_permission_templates(session: Session):
 
     Concurrency-safe: uses ``INSERT ... ON CONFLICT DO NOTHING`` on the UNIQUE
     ``(persona, resource_type)`` constraint, so a racing/repeated seed can never
-    duplicate matrix cells.
+    duplicate matrix cells. Cells are inserted only for personas that still
+    exist, under their persona locks (a deleted default persona is never
+    given cells again).
     """
-    seed_permission_templates(session)
+    _insert_template_rows(session, default_permission_template_rows())

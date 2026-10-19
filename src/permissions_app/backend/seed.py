@@ -85,7 +85,7 @@ def _persona_definition_rows() -> list[dict]:
     ]
 
 
-def _permission_template_rows() -> list[dict]:
+def default_permission_template_rows() -> list[dict]:
     return [
         {
             "persona": persona.value,
@@ -110,7 +110,7 @@ def _permission_template_stmt():
     # ON CONFLICT on the (persona, resource_type) UNIQUE constraint.
     return (
         pg_insert(PermissionTemplate.__table__)
-        .values(_permission_template_rows())
+        .values(default_permission_template_rows())
         .on_conflict_do_nothing(index_elements=["persona", "resource_type"])
     )
 

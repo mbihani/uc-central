@@ -398,6 +398,7 @@ process-local locks elsewhere) in **one global order**:
 | Persona delete | persona → each mapped group → grants |
 | Persona Apply | persona → its mapped groups → grants |
 | Create a mapping | persona |
+| Every other persona-keyed write: create / update persona, add / remove a direct user, set a matrix cell, set / clear a per-space override, the matrix backfill and lazy default-template seed | persona |
 | Remove a mapping | group → grants |
 | Bundle apply / resync / delete | grants only |
 
@@ -408,6 +409,10 @@ them, so a removal that finished meanwhile makes Apply skip that group instead
 of re-granting from a stale plan. Persona delete holds its persona lock
 through the final commit. Mapping creation takes the same lock and re-checks
 that the persona exists, so no mapping can ever point at a deleted persona.
+The same holds for **every** write that references a persona (helper
+`_persona_write`): it takes the persona lock and re-checks the persona under
+it (400/404 if gone). The matrix backfill and the lazy template seed insert
+cells only for personas that still exist, checked under their locks.
 Nothing holding a lock waits for one of an earlier class or a smaller key, so
 there is no deadlock. Both rules are enforced at runtime. All locks of one
 operation share its single pooled connection.
