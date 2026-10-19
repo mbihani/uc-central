@@ -380,6 +380,37 @@ overrides, user mappings) is deleted only once every group's cleanup has
 succeeded. A removal preview (`GET /api/personas/mappings/{id}/removal-preview`)
 shows the result first and writes nothing.
 
+**Removal recomputes every persona-managed type, which can undo Resources-page
+edits.** Removing a persona from a group rewrites the group's entry on every
+resource of every supported type, not only the types that persona grants.
+Wherever no remaining persona (or Genie bundle) grants access, the group's
+entry is **removed**, including entries an admin set by hand for that group on
+the Resources page. The removal preview says so. Re-add such an entry after the
+removal if it is still wanted (or give it to the group through a persona).
+
+**Concurrency.** Apply, mapping removal and persona delete take a per-**group**
+operation lock (Postgres advisory lock keyed on the group id; process-local
+locks elsewhere). It is held from the mapping read through the plan, the
+workspace writes and the ledger check, to the mapping deletion. Apply reads the
+mappings, takes the locks, and re-reads them under the lock, so a removal that
+finished meanwhile makes Apply skip that group instead of re-granting it from a
+stale plan. Lock order: all operation locks first (ascending, taken once),
+then per-grant locks inside. Nothing holding a grant lock waits for an
+operation lock, and bundle operations take grant locks only, so there is no
+deadlock. The per-grant locks reuse the operation's pooled connection.
+
+**When removal is refused (mapping kept, retry later):**
+* any ACL write or UC revoke failed, or a ledger row of the persona is left;
+* a Genie entry could not be recomputed (space unreadable, group not
+  confirmed as an account group). Its ACL may still carry the persona's
+  access, including legacy ACLs written before the ledger existed;
+* the group lookup failed transiently.
+
+A group **confirmed deleted** (by-id lookup returns *not found*) is the
+exception. There is no principal left to revoke from, so the persona's ledger
+rows for it are forgotten with no workspace call (like a bundle's
+`forget_orphaned`), listed in the response, and the mapping is deleted.
+
 Why there used to be one persona per group: the original apply wrote each
 group's ACL straight from *its one* persona's cell, so a second persona would
 have overwritten the first (last apply wins). The `UNIQUE (group_id)` on

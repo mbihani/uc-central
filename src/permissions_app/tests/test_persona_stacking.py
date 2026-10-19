@@ -77,8 +77,13 @@ class StackWorkspace(FakeWorkspace):
         self.space_acl[HR] = {}
         self.groups_by_id["g-3"] = (HR_GROUP, "Group")
         self.genie = SimpleNamespace(get_space=self._get_space)
+        self.unreadable: set[str] = set()  # spaces the SP cannot read
 
     def _get_space(self, space_id, include_serialized_space=None):
+        if space_id in self.unreadable:
+            from databricks.sdk.errors import PermissionDenied
+
+            raise PermissionDenied("no access to the space")
         if space_id not in self.space_defs or space_id not in self.space_acl:
             from databricks.sdk.errors import NotFound
 
@@ -683,5 +688,201 @@ def test_pg_constraint_lookup_is_scoped_to_the_ledger_table():
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE decoy_local"))
         conn.execute(text("DROP SCHEMA decoy CASCADE"))
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+
+# ═══ Review round 3: serialized removal, deleted groups, blocked Genie ═══
+
+
+def test_confirmed_deleted_group_forgets_ledger_rows_without_workspace_calls(session, ws):
+    _sales_hr(session)
+    m = _map(session, "sales_analyst")
+    mid = m.id or 0
+    apply_permissions("sales_analyst", ws, session, None, "admin")
+    assert _rows(session, persona="sales_analyst")
+    del ws.groups_by_id["g-1"]  # by-id lookup now returns NotFound
+    n_updates, n_sets = len(ws.updates), len(ws.space_sets)
+
+    out = delete_persona_mapping(mid, ws, session, "admin")
+
+    assert out.mapping_removed and out.errors == []
+    assert session.get(PersonaGroupMapping, mid) is None
+    assert _rows(session, persona="sales_analyst") == []  # forgotten
+    assert (len(ws.updates), len(ws.space_sets)) == (n_updates, n_sets)  # no workspace call
+    assert any("forgotten" in w for w in out.warnings)
+
+
+def test_transient_group_lookup_error_keeps_mapping_and_rows(session, ws):
+    _sales_hr(session)
+    m = _map(session, "sales_analyst")
+    mid = m.id or 0
+    apply_permissions("sales_analyst", ws, session, None, "admin")
+    real_get = ws.groups.get
+    n_rows = len(_rows(session))
+
+    def flaky(id):
+        raise RuntimeError("SCIM timed out")
+
+    ws.groups.get = flaky
+    out = delete_persona_mapping(mid, ws, session, "admin")
+    assert not out.mapping_removed and out.errors
+    assert session.get(PersonaGroupMapping, mid) is not None
+    assert len(_rows(session)) == n_rows
+
+    ws.groups.get = real_get
+    assert delete_persona_mapping(mid, ws, session, "admin").mapping_removed
+
+
+def test_unreadable_space_blocks_removal_until_it_can_be_recomputed(session, ws):
+    """A legacy (pre-ledger) persona ACL: the group holds CAN_MANAGE on Sales
+    from space_admin with NO ledger rows. sales_analyst (CAN_RUN on Sales)
+    remains. While Sales cannot be read, the group's Sales entry can't be
+    recomputed, so removing space_admin must keep the mapping."""
+    _sales_hr(session)
+    _persona(session, "space_admin", {GENIE: NONE}, {SALES: CAN_MANAGE})
+    _map(session, "sales_analyst")
+    admin = _map(session, "space_admin")
+    ws.space_acl[SALES][("group", GROUP)] = CAN_MANAGE  # legacy, unledgered
+    ws.unreadable.add(SALES)
+
+    out = delete_persona_mapping(admin.id or 0, ws, session, "admin")
+
+    assert not out.mapping_removed
+    assert any("Mapping kept" in e for e in out.errors), out.errors
+    assert session.get(PersonaGroupMapping, admin.id) is not None
+    assert ws.level(SALES) == CAN_MANAGE  # untouched, and the mapping says why
+
+    ws.unreadable.clear()
+    again = delete_persona_mapping(admin.id or 0, ws, session, "admin")
+
+    assert again.mapping_removed, again.errors
+    assert ws.level(SALES) == CAN_RUN  # recomputed from sales_analyst
+    assert ws.has("table", ORDERS, "SELECT")
+
+
+def _pg_setup(engine):
+    SQLModel.metadata.drop_all(engine)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        _sales_hr(s)
+        mid = _map(s, "sales_analyst").id
+        _map(s, "sales_analyst", "g-3", HR_GROUP)
+        _map(s, "hr_analyst")
+    return mid
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_removal_waits_for_an_inflight_apply_postgres(ws, monkeypatch):
+    """Apply builds its plan, then pauses before granting. A removal of the
+    same group's mapping must wait for it (group operation lock) and then
+    clean up — instead of finishing first and letting Apply recreate rows and
+    grants from its stale plan (orphans with no mapping)."""
+    import threading
+
+    from permissions_app.backend import router
+
+    engine = create_engine(PG_URL or "")
+    mid = _pg_setup(engine)
+    with Session(engine) as s:
+        apply_permissions("sales_analyst", ws, s, None, "admin")  # rows exist
+    paused, go = threading.Event(), threading.Event()
+    real_exec = router.execute_genie_table_grants
+
+    def paused_exec(*a, **k):
+        if threading.current_thread().name == "apply":
+            paused.set()
+            assert go.wait(20)
+        return real_exec(*a, **k)
+
+    monkeypatch.setattr(router, "execute_genie_table_grants", paused_exec)
+    errors: list[str] = []
+    results: dict = {}
+
+    def run(name, fn):
+        try:
+            with Session(engine) as s:
+                results[name] = fn(s)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    t_apply = threading.Thread(
+        name="apply", target=run,
+        args=("apply", lambda s: apply_permissions("sales_analyst", ws, s, None, "admin")),
+    )
+    t_apply.start()
+    assert paused.wait(20)
+    t_remove = threading.Thread(
+        name="remove", target=run,
+        args=("remove", lambda s: delete_persona_mapping(mid or 0, ws, s, "admin")),
+    )
+    t_remove.start()
+    t_remove.join(1.0)
+    assert t_remove.is_alive(), "removal did not wait for the in-flight Apply"
+    go.set()
+    t_apply.join(30)
+    t_remove.join(30)
+    assert errors == [] and results["remove"].mapping_removed, results.get("remove")
+
+    with Session(engine) as s:
+        assert s.get(PersonaGroupMapping, mid) is None
+        left = [r for r in _rows(s, persona="sales_analyst") if r.group_id == "g-1"]
+        assert left == [], left  # no orphan rows for the removed mapping
+    # g-1 keeps only what hr_analyst gives; no Sales access / grants left.
+    assert ws.level(SALES) is None and not ws.has("table", ORDERS, "SELECT")
+    assert ws.has("table", ORDERS, "SELECT", principal=HR_GROUP)  # g-3 untouched
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_concurrent_apply_remove_and_bundle_ops_do_not_deadlock_postgres(ws, monkeypatch):
+    import threading
+    import time
+
+    from permissions_app.backend import genie_bundles as gb
+    from permissions_app.backend.genie_bundles import delete_bundle
+
+    engine = create_engine(PG_URL or "", pool_size=5, max_overflow=0, pool_timeout=20)
+    _pg_setup(engine)
+    with Session(engine) as s:
+        g3 = s.exec(select(PersonaGroupMapping).where(PersonaGroupMapping.group_id == "g-3")).one()
+        g3_id = g3.id
+        bundle_id = _bundle(s).id  # g-1, Sales
+    monkeypatch.setattr(gb, "_after_pending_commit", lambda key: time.sleep(0.02))
+    ops = {
+        "apply_sales": lambda s: apply_permissions("sales_analyst", ws, s, None, "admin"),
+        "apply_hr": lambda s: apply_permissions("hr_analyst", ws, s, None, "admin"),
+        "remove_g3": lambda s: delete_persona_mapping(g3_id or 0, ws, s, "admin"),
+        "bundle_apply": lambda s: _apply(ws, s, s.get(gb.GenieAccessBundle, bundle_id)),
+    }
+    barrier = threading.Barrier(len(ops))
+    errors: list[str] = []
+
+    def worker(name, fn):
+        try:
+            with Session(engine) as s:
+                barrier.wait()
+                fn(s)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+
+    threads = [threading.Thread(target=worker, args=item) for item in ops.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not any(t.is_alive() for t in threads), "deadlock / hang"
+    assert errors == [], errors
+    # Then a bundle delete racing a final apply: also completes.
+    with Session(engine) as s:
+        b = s.get(gb.GenieAccessBundle, bundle_id)
+        assert b is not None
+        delete_bundle(ws, s, b)
+    with Session(engine) as s:
+        assert s.get(PersonaGroupMapping, g3_id) is None
+        assert not [r for r in _rows(s) if r.group_id == "g-3"]  # g-3 fully cleaned
+        assert not ws.has("table", ORDERS, "SELECT", principal=HR_GROUP)
     SQLModel.metadata.drop_all(engine)
     engine.dispose()

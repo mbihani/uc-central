@@ -27,8 +27,8 @@ import json
 import re
 import hashlib
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 
 from databricks.sdk import WorkspaceClient
@@ -699,6 +699,88 @@ def grant_lock_key(group_id: str, key: GrantKey) -> int:
 
 _HELD_LOCKS = "genie_grant_locks_held"
 _LOCK_CONN = "genie_grant_lock_conn"
+_HELD_OP_LOCKS = "persona_group_op_locks_held"
+
+
+def group_op_lock_key(group_id: str) -> int:
+    """Advisory-lock key for persona OPERATIONS on one group (separate
+    namespace from the per-grant keys)."""
+    raw = "\x1f".join(["persona-group-op", group_id]).encode()
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big", signed=True)
+
+
+@contextmanager
+def group_operation_locks(session: Session, group_ids: Iterable[str]) -> Iterator[None]:
+    """Serialize persona Apply / mapping removal / persona delete per GROUP.
+
+    Held across the whole operation — mapping re-read, plan, workspace
+    writes, ledger verification and mapping deletion — so an Apply can never
+    act on a stale plan after a concurrent removal deleted the mapping (and
+    vice versa). Keyed on the group id, not (group, persona): Apply recreates
+    rows for EVERY persona of a group, so it must exclude every removal on
+    that group.
+
+    Lock ordering (deadlock freedom): all operation locks are taken ONCE, at
+    the start, in ascending key order, BEFORE any per-grant lock; nothing that
+    holds a grant lock ever waits for an operation lock (bundles take grant
+    locks only). Per-grant locks taken inside reuse this pooled connection, so
+    an operation still uses ONE connection. Postgres: session-level advisory
+    locks; other dialects: process-local locks with the same scope.
+    """
+    keys = sorted({group_op_lock_key(g) for g in group_ids if g})
+    if session.info.get(_HELD_LOCKS) or session.info.get(_HELD_OP_LOCKS):
+        raise RuntimeError(
+            "Group operation locks must be taken once, before any grant lock."
+        )
+    if not keys:
+        yield
+        return
+    if session.in_transaction():
+        session.commit()
+    session.info[_HELD_OP_LOCKS] = keys
+    try:
+        engine = session.get_bind().engine
+        if engine.dialect.name != "postgresql":
+            with _LOCAL_LOCKS_GUARD:
+                locks = [_LOCAL_LOCKS.setdefault(k, threading.Lock()) for k in keys]
+            with ExitStack() as stack:
+                for lock in locks:
+                    stack.enter_context(lock)
+                try:
+                    yield
+                finally:
+                    if session.in_transaction():
+                        session.rollback()
+            return
+
+        lock_conn = engine.connect()
+        session.info[_LOCK_CONN] = (lock_conn, session.bind)
+        acquired: list[int] = []
+        try:
+            for k in keys:
+                lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": k})
+                acquired.append(k)
+            lock_conn.commit()
+            session.bind = lock_conn  # ORM work shares the lock connection
+            yield
+        finally:
+            _, original_bind = session.info.pop(_LOCK_CONN)
+            if session.in_transaction():
+                session.rollback()
+            session.bind = original_bind
+            try:
+                if lock_conn.in_transaction():
+                    lock_conn.rollback()
+                for k in reversed(acquired):
+                    lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": k})
+                lock_conn.commit()
+            except Exception:
+                lock_conn.invalidate()
+                raise
+            finally:
+                lock_conn.close()
+    finally:
+        session.info.pop(_HELD_OP_LOCKS, None)
 
 
 @contextmanager
@@ -733,7 +815,8 @@ def _grant_lock(session: Session, group_id: str, key: GrantKey) -> Iterator[None
         # committed their work; this just ends any read-only snapshot and
         # returns the session's own pooled connection).
         session.commit()
-    outermost = not held
+    # Own the lock connection only if no enclosing grant / operation lock does.
+    outermost = _LOCK_CONN not in session.info
     held.append(k)
     try:
         engine = session.get_bind().engine

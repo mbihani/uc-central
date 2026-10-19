@@ -28,6 +28,19 @@ from permissions_app.backend.router import (
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _no_group_operation_locks():
+    """These tests drive Apply with a MagicMock session, which cannot hold the
+    real group operation locks (covered in test_persona_stacking)."""
+    from contextlib import nullcontext
+
+    with patch(
+        "permissions_app.backend.router.group_operation_locks",
+        side_effect=lambda *_a, **_k: nullcontext(),
+    ):
+        yield
+
+
 def _make_resource(rid, name="res"):
     return SimpleNamespace(id=rid, name=name)
 

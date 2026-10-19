@@ -428,9 +428,12 @@ function GroupMappingBadge({
                 <p>
                   The group's access is recomputed from its remaining personas
                   {otherPersonas.length > 0 ? ` (${otherPersonas.join(", ")})` : ""}{" "}
-                  and Genie access bundles. Only what nothing else grants is
-                  removed; table grants are revoked only if the app created them
-                  and no other persona or bundle still needs them.
+                  and Genie access bundles, on EVERY persona-managed resource
+                  type. Wherever nothing else grants access the group's entry is
+                  removed, including entries set by hand on the Resources page.
+                  Table grants are revoked only if the app created them and no
+                  other persona or bundle still needs them. If any step fails,
+                  the mapping is kept so you can retry.
                 </p>
                 {preview.isLoading && <Skeleton className="h-16 w-full" />}
                 {preview.isError && (

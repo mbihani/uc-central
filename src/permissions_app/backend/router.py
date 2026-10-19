@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import re
 from typing import Annotated
 
@@ -73,7 +74,7 @@ from .models import (
     get_permission_rank,
     is_permission_level_allowed,
 )
-from .genie_bundles import PERSONA_SOURCE_PREFIX
+from .genie_bundles import PERSONA_SOURCE_PREFIX, group_operation_locks
 from .persona_sync import (
     GENIE,
     NONE,
@@ -714,11 +715,31 @@ def delete_persona(
     if not defn:
         raise HTTPException(status_code=404, detail="Persona not found")
 
-    mappings = session.exec(
-        select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona_key)
-    ).all()
-    refs = resolve_groups(obo_ws, mappings)
-    resynced = [_remove_group_persona(obo_ws, session, m, refs[m.group_id], actor) for m in mappings]
+    def mapped():
+        return session.exec(
+            select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona_key)
+        ).all()
+
+    # Serialized with Apply / removal on the same groups; mappings re-read
+    # under the lock. A group mapped after the first read is not locked: the
+    # delete then refuses (below) rather than leaving that mapping behind.
+    gids = {m.group_id for m in mapped()}
+    with group_operation_locks(session, gids):
+        mappings = [m for m in mapped() if m.group_id in gids]
+        refs = resolve_groups(obo_ws, mappings)
+        resynced = [
+            _remove_group_persona(obo_ws, session, m, refs[m.group_id], actor) for m in mappings
+        ]
+    if any(m.group_id not in gids for m in mapped()):
+        return {
+            "status": "incomplete",
+            "persona_deleted": False,
+            "message": (
+                f"Persona '{persona_key}' was NOT deleted: a group was mapped to it "
+                f"while it was being deleted. Retry."
+            ),
+            "groups_recomputed": [r.model_dump() for r in resynced],
+        }
     if not all(r.mapping_removed for r in resynced):
         return {
             "status": "incomplete",
@@ -836,8 +857,13 @@ def delete_persona_mapping(
     mapping = session.get(PersonaGroupMapping, mapping_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="Mapping not found")
-    group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
-    return _remove_group_persona(obo_ws, session, mapping, group_ref, actor)
+    with group_operation_locks(session, [mapping.group_id]):
+        # Re-read under the lock (a concurrent removal may have finished).
+        mapping = session.get(PersonaGroupMapping, mapping_id, populate_existing=True)
+        if not mapping:
+            raise HTTPException(status_code=404, detail="Mapping not found")
+        group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
+        return _remove_group_persona(obo_ws, session, mapping, group_ref, actor)
 
 
 def _acl_types() -> list[str]:
@@ -872,14 +898,31 @@ def _remove_group_persona(
     to what the remaining personas / bundles grant, and Genie always runs, so
     table grants the persona sourced in the past are released (revoked only if
     the app made them and no other persona / bundle still needs them).
-    Success = no write / revoke errors AND no ledger row of this persona left
-    for the group.
+    Success = no write / revoke errors, every Genie entry recomputed (a
+    BLOCKED entry — unreadable space, group not confirmed as an account group —
+    is an error: its ACL was left untouched), AND no ledger row of this
+    persona left for the group. The caller holds the group operation lock.
+
+    A group CONFIRMED deleted (by-id lookup: not found) has no principal left
+    to revoke from: this persona's ledger rows for it are forgotten with no
+    workspace call (like a bundle's ``forget_orphaned``), then the mapping is
+    deleted. A transient lookup error keeps everything for a retry.
     """
     gid, removed = mapping.group_id, mapping.persona
     out = GroupResyncOut(group_id=gid, group_name=group_ref.name, removed_persona=removed)
     if group_ref.missing:
+        forgotten = _persona_ledger_rows(session, gid, removed)
+        for r in forgotten:
+            session.delete(r)
         out.warnings.append(
-            f"Group id {gid} no longer exists; mapping removed, nothing recomputed."
+            f"Group id {gid} no longer exists (confirmed); mapping removed and "
+            f"{len(forgotten)} ledger row(s) of persona '{removed}' forgotten without "
+            f"any workspace call"
+            + (
+                f": {', '.join(sorted(f'{r.privilege} on {r.full_name}' for r in forgotten))}."
+                if forgotten
+                else "."
+            )
         )
     elif group_ref.lookup_error:
         out.errors.append(f"{group_ref.lookup_error} Mapping kept; retry the removal.")
@@ -895,7 +938,14 @@ def _remove_group_persona(
                 out.table_grants_added += outcome.added
                 out.table_grants_revoked += outcome.revoked
                 out.errors.extend(outcome.errors)
-                out.warnings.extend(outcome.blocked + outcome.warnings)
+                # Blocked = the group's ACL entry on that space was NOT
+                # recomputed (it may still carry this persona's access): the
+                # mapping must stay until it can be.
+                out.errors.extend(
+                    f"{b} Mapping kept until this space can be recomputed; retry the removal."
+                    for b in outcome.blocked
+                )
+                out.warnings.extend(outcome.warnings)
                 continue
             updated, errors = _apply_type(obo_ws, rt, _group_levels(groups, personas_of, cells, rt))
             out.resources_updated += updated
@@ -950,8 +1000,10 @@ def preview_persona_mapping_removal(
         out.table_grants.extend(grants)
         out.warnings.extend(warnings)
     out.warnings.append(
-        "Every supported resource type is recomputed for this group: where no "
-        "remaining persona grants anything, the group's entry is removed."
+        "Removal recomputes EVERY persona-managed resource type for this group, "
+        "not only the ones this persona grants: wherever no remaining persona (or "
+        "Genie bundle) grants access, the group's entry is REMOVED — including "
+        "entries set by hand on the Resources page."
     )
     return out
 
@@ -1940,6 +1992,38 @@ def apply_permissions(
         requested_set = set(requested_types)
         templates = [t for t in templates if t.resource_type in requested_set]
 
+    # Serialize with mapping removal / persona delete on the same groups (see
+    # genie_bundles.group_operation_locks). Mappings are RE-READ under the lock:
+    # a removal that finished while we waited deleted its mapping, so that group
+    # is skipped instead of being re-granted from a stale read. A group mapped
+    # only after the first read is not locked and therefore not applied now.
+    gids = {m.group_id for m in mappings}
+    with group_operation_locks(session, gids):
+        mappings = [
+            m
+            for m in session.exec(
+                select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona)
+            ).all()
+            if m.group_id in gids
+        ]
+        _after_apply_mappings_read()
+        return _apply_mapped(persona, obo_ws, session, mappings, templates, actor)
+
+
+def _after_apply_mappings_read() -> None:
+    """No-op seam: called by Apply right after it re-read the mappings under the
+    group operation locks (tests pause here)."""
+
+
+def _apply_mapped(
+    persona: str,
+    obo_ws: WorkspaceClient,
+    session: Session,
+    mappings: Sequence[PersonaGroupMapping],
+    templates: Sequence[PermissionTemplate],
+    actor: str,
+) -> ApplyAllResultOut:
+    """The Apply write loop; the caller holds the group operation locks."""
     # Personas STACK (see persona_sync). Each mapped group's level on an object
     # is the HIGHEST its own personas (and, for Genie, applied bundles) grant
     # there. Every member of the group holds all of the GROUP's personas, so this
