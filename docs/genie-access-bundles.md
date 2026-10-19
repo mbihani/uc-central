@@ -140,6 +140,10 @@ drops or rewrites data:
     moves from (bundle, principal, grant) to (source, group_id, grant), with a
     `CHECK (source <> '')`. A row that can't be given a source, or that would
     break the new key, fails startup loudly and changes nothing.
+  * On Postgres every "does this constraint exist?" check looks only at
+    constraints **on the table itself** (`conrelid = to_regclass(<table>)` in
+    the app's schema), so a same-named constraint on another table or schema
+    can't make the migration skip one.
   * The unique index `uq_genie_access_bundle_space_id` is created. **If that
     database already has several bundles for one space, startup fails loudly**
     with a `RuntimeError` naming each space and its bundle count. Nothing is
@@ -361,13 +365,20 @@ its *members* hold through *other* groups; Databricks unions those at access
 time.
 
 Removing a persona from a group (or deleting the persona) **recomputes** the
-group from its remaining personas and applied bundles, on the resource types
-the removed persona granted something on. Each resource's entry is set to what
-is left (removed only if nothing grants it), and the persona's Genie table
-grants are released: revoked only if the app made them and no other persona or
-bundle of that group still needs them. A removal preview
-(`GET /api/personas/mappings/{id}/removal-preview`) shows the result first and
-writes nothing.
+group **without** that persona *before* anything is deleted. The scope never
+depends on what the persona grants now (its cells may have been lowered
+without an Apply): **every** supported resource type is rewritten to what the
+remaining personas and applied bundles grant (the entry is removed where
+nothing does), and Genie always runs, so table grants the persona sourced
+earlier are released — revoked only if the app made them and no other persona,
+bundle or pre-existing grant keeps them. The mapping is deleted **only if the
+cleanup fully succeeded** (no ACL / UC error, and no ledger row of that persona
+left for the group). Otherwise it is kept, the response has
+`mapping_removed: false` plus the errors, and calling the removal again retries
+it. Deleting a persona works the same way per group; the persona (templates,
+overrides, user mappings) is deleted only once every group's cleanup has
+succeeded. A removal preview (`GET /api/personas/mappings/{id}/removal-preview`)
+shows the result first and writes nothing.
 
 Why there used to be one persona per group: the original apply wrote each
 group's ACL straight from *its one* persona's cell, so a second persona would

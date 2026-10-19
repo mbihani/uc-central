@@ -115,6 +115,19 @@ def _permission_template_stmt():
     )
 
 
+def _pg_constraints(conn: Connection, table: str) -> set[str]:
+    """Names of the constraints ON ``table`` (resolved through the active
+    search_path, i.e. the app's schema). Postgres constraint names are only
+    unique per table, so a global ``conname`` lookup could match a same-named
+    constraint on another table or schema and wrongly skip adding ours."""
+    return set(
+        conn.execute(
+            text("SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(:t)"),
+            {"t": table},
+        ).scalars().all()
+    )
+
+
 def ensure_unique_constraints(conn: Connection) -> None:
     """De-dup + add the UNIQUE constraints IF missing. Idempotent & safe to run
     concurrently only while holding the bootstrap advisory lock (the caller does).
@@ -123,11 +136,7 @@ def ensure_unique_constraints(conn: Connection) -> None:
     interpolating them into the DDL is safe.
     """
     for table, cols, name in _UNIQUE_CONSTRAINTS:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_constraint WHERE conname = :name"),
-            {"name": name},
-        ).first()
-        if exists:
+        if name in _pg_constraints(conn, table):
             continue
 
         # Remove any pre-existing duplicates (keep the lowest id) so the UNIQUE
@@ -268,12 +277,7 @@ def _upgrade_ledger_sources(conn: Connection) -> None:
         conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN source DROP DEFAULT"))
         conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN bundle_id DROP NOT NULL"))
         conn.execute(text(f"ALTER TABLE {ledger} DROP CONSTRAINT IF EXISTS {LEGACY_LEDGER_UNIQUE}"))
-        existing = set(
-            conn.execute(
-                text("SELECT conname FROM pg_constraint WHERE conname IN (:a, :b)"),
-                {"a": GENIE_LEDGER_SOURCE_CHECK, "b": GENIE_LEDGER_SOURCE_UNIQUE},
-            ).scalars().all()
-        )
+        existing = _pg_constraints(conn, ledger)
         if GENIE_LEDGER_SOURCE_CHECK not in existing:
             conn.execute(
                 text(
@@ -381,11 +385,7 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
         # Existing PG databases: the column was added with a transitional ''
         # default; make it strictly required like a fresh database.
         conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN group_id DROP DEFAULT"))
-        has_check = conn.execute(
-            text("SELECT 1 FROM pg_constraint WHERE conname = :n"),
-            {"n": GENIE_LEDGER_GROUP_ID_CHECK},
-        ).first()
-        if not has_check:
+        if GENIE_LEDGER_GROUP_ID_CHECK not in _pg_constraints(conn, ledger):
             conn.execute(
                 text(
                     f"ALTER TABLE {ledger} ADD CONSTRAINT {GENIE_LEDGER_GROUP_ID_CHECK} "

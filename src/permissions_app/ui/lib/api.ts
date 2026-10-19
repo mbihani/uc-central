@@ -181,6 +181,7 @@ export interface GroupResyncOut {
   errors?: string[];
   group_id: string;
   group_name: string;
+  mapping_removed?: boolean;
   removed_persona: string;
   resources_updated?: number;
   table_grants_added?: number;

@@ -363,6 +363,14 @@ function GroupMappingBadge({
     mutation: {
       onSuccess: ({ data }) => {
         const errors = data.errors ?? [];
+        if (!data.mapping_removed) {
+          // Cleanup failed: the backend KEPT the mapping so this can be retried.
+          toast.error(
+            `${groupName} still has ${personaLabel}: cleanup failed (${errors.length} error(s)) — ${errors[0] ?? "unknown error"}. Fix it and remove again to retry.`,
+          );
+          onDeleted();
+          return;
+        }
         const revoked = data.table_grants_revoked ?? 0;
         const summary = `Removed ${personaLabel} from ${groupName}; recomputed ${data.resources_updated ?? 0} resource(s)` +
           (revoked ? `, revoked ${revoked} table grant(s)` : "");
@@ -996,9 +1004,14 @@ function DeletePersonaDialog({
 }) {
   const deletePersonaMutation = useDeletePersona({
     mutation: {
-      onSuccess: () => {
-        toast.success(`Persona "${persona.label}" deleted`);
-        onOpenChange(false);
+      onSuccess: ({ data }) => {
+        if (data.persona_deleted === false) {
+          // Some group's cleanup failed: persona + those mappings were kept.
+          toast.error(String(data.message ?? "Persona was not deleted; retry."));
+        } else {
+          toast.success(`Persona "${persona.label}" deleted`);
+          onOpenChange(false);
+        }
         onDeleted();
       },
       onError: (error) => {
@@ -1025,7 +1038,9 @@ function DeletePersonaDialog({
               <li>All associated permission templates and per-space levels</li>
             </ul>
             <span className="block mt-2">
-              Each mapped group is then recomputed from its remaining personas:
+              Each mapped group is first recomputed without this persona (the
+              persona is deleted only if every group's cleanup succeeds; otherwise
+              it is kept so you can retry):
               access only this persona gave is removed, and Genie table grants
               it needed are revoked unless another persona or bundle still needs
               them (pre-existing grants are never revoked).

@@ -22,6 +22,7 @@ from .logger import logger
 from .models import (
     OVERRIDABLE_RESOURCE_TYPES,
     AddMemberIn,
+    GenieGrantLedger,
     GroupLevelOut,
     GroupResyncOut,
     GroupResyncPreviewOut,
@@ -72,6 +73,7 @@ from .models import (
     get_permission_rank,
     is_permission_level_allowed,
 )
+from .genie_bundles import PERSONA_SOURCE_PREFIX
 from .persona_sync import (
     GENIE,
     NONE,
@@ -700,10 +702,11 @@ def delete_persona(
 ):
     """Delete a persona and all its associated mappings and permission templates.
 
-    Every group the persona was mapped to is then RECOMPUTED from its remaining
-    personas (exactly like removing the mapping): its entries on the types this
-    persona granted are set to what is left, and table grants the persona
-    sourced are released (revoked only if app-made and nothing else needs them).
+    Every group the persona is mapped to is first RECOMPUTED without it, exactly
+    like removing the mapping (see ``_remove_group_persona``). A mapping is
+    deleted only once its group's cleanup succeeded; if any group's cleanup
+    fails, that mapping AND the persona (templates, overrides, user mappings)
+    are kept and the errors are returned, so the delete can simply be retried.
     """
     defn = session.exec(
         select(PersonaDefinition).where(PersonaDefinition.key == persona_key)
@@ -711,14 +714,22 @@ def delete_persona(
     if not defn:
         raise HTTPException(status_code=404, detail="Persona not found")
 
-    # Delete associated group mappings
     mappings = session.exec(
         select(PersonaGroupMapping).where(PersonaGroupMapping.persona == persona_key)
     ).all()
-    affected = _types_granted_by(session, persona_key)
-    group_refs = resolve_groups(obo_ws, mappings) if affected else {}
-    for m in mappings:
-        session.delete(m)
+    refs = resolve_groups(obo_ws, mappings)
+    resynced = [_remove_group_persona(obo_ws, session, m, refs[m.group_id], actor) for m in mappings]
+    if not all(r.mapping_removed for r in resynced):
+        return {
+            "status": "incomplete",
+            "persona_deleted": False,
+            "message": (
+                f"Persona '{persona_key}' was NOT deleted: cleanup failed for "
+                f"{sum(not r.mapping_removed for r in resynced)} group(s); their mappings "
+                f"were kept. Fix the errors and retry."
+            ),
+            "groups_recomputed": [r.model_dump() for r in resynced],
+        }
 
     # Delete associated user mappings
     user_maps = session.exec(
@@ -742,12 +753,9 @@ def delete_persona(
     session.delete(defn)
     session.commit()
 
-    resynced = [
-        _resync_group(obo_ws, session, ref, persona_key, affected, actor)
-        for ref in group_refs.values()
-    ]
     return {
         "status": "ok",
+        "persona_deleted": True,
         "message": f"Persona '{persona_key}' deleted",
         "groups_recomputed": [r.model_dump() for r in resynced],
     }
@@ -816,60 +824,93 @@ def delete_persona_mapping(
     actor: ActorDep = "",
     _admin: AdminRequired = True,
 ):
-    """Remove a persona from a group, then RECOMPUTE that group's access from
-    its remaining personas (and applied bundles).
+    """Remove a persona from a group: RECOMPUTE the group's access without that
+    persona (from its remaining personas and applied bundles) and only THEN
+    delete the mapping.
 
-    Only resource types where the removed persona granted something are
-    touched: each resource's entry for the group is set to the remaining
-    effective level (removed only when nothing else grants it), and Genie table
-    grants this persona sourced are released — revoked only if the app made
-    them and no remaining persona / bundle still needs them.
+    If any part of the cleanup fails (an ACL write, a UC revoke, a space whose
+    grants could not be released), the mapping is KEPT, ``mapping_removed`` is
+    false and the errors are returned: calling this endpoint again retries the
+    cleanup. Nothing is orphaned, even for a group with no other persona.
     """
     mapping = session.get(PersonaGroupMapping, mapping_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="Mapping not found")
-    removed = mapping.persona
-    affected = _types_granted_by(session, removed)
     group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
-    session.delete(mapping)
-    session.commit()
-    return _resync_group(obo_ws, session, group_ref, removed, affected, actor)
+    return _remove_group_persona(obo_ws, session, mapping, group_ref, actor)
 
 
-def _resync_group(
+def _acl_types() -> list[str]:
+    """Every resource type the app can enumerate and write ACLs for."""
+    return [rt.value for rt in ResourceType if rt.value in SUPPORTED_ACL_RESOURCE_TYPES]
+
+
+def _persona_ledger_rows(session: Session, group_id: str, persona: str) -> list[GenieGrantLedger]:
+    prefix = f"{PERSONA_SOURCE_PREFIX}{persona}:space:"
+    return list(
+        session.exec(
+            select(GenieGrantLedger).where(
+                GenieGrantLedger.group_id == group_id,
+                col(GenieGrantLedger.source).startswith(prefix),
+            )
+        ).all()
+    )
+
+
+def _remove_group_persona(
     obo_ws: WorkspaceClient,
     session: Session,
+    mapping: PersonaGroupMapping,
     group_ref: GroupRef,
-    removed: str,
-    affected: list[str],
     actor: str,
 ) -> GroupResyncOut:
-    """After ``removed`` stopped applying to a group: rewrite the group's entry
-    on every resource of the ``affected`` types to what its REMAINING personas
-    (and applied bundles) grant, and release table grants nothing needs."""
-    out = GroupResyncOut(
-        group_id=group_ref.group_id, group_name=group_ref.name, removed_persona=removed
-    )
+    """Recompute ``mapping``'s group WITHOUT its persona, then delete the mapping
+    only if the cleanup fully succeeded.
+
+    The scope does not depend on what the persona grants NOW (its cells may
+    have been lowered without an Apply): EVERY supported ACL type is rewritten
+    to what the remaining personas / bundles grant, and Genie always runs, so
+    table grants the persona sourced in the past are released (revoked only if
+    the app made them and no other persona / bundle still needs them).
+    Success = no write / revoke errors AND no ledger row of this persona left
+    for the group.
+    """
+    gid, removed = mapping.group_id, mapping.persona
+    out = GroupResyncOut(group_id=gid, group_name=group_ref.name, removed_persona=removed)
     if group_ref.missing:
         out.warnings.append(
-            f"Group id {group_ref.group_id} no longer exists; mapping removed, nothing recomputed."
+            f"Group id {gid} no longer exists; mapping removed, nothing recomputed."
         )
-        return out
-    groups = {group_ref.group_id: group_ref}
-    personas_of = personas_by_group(session, groups)
-    cells = load_cells(session, personas_of[group_ref.group_id])
-    for rt in affected:
-        if rt == GENIE:
-            outcome = _apply_genie(obo_ws, session, groups, actor)
-            out.resources_updated += outcome.updated
-            out.table_grants_added += outcome.added
-            out.table_grants_revoked += outcome.revoked
-            out.errors.extend(outcome.errors)
-            out.warnings.extend(outcome.warnings)
-            continue
-        updated, errors = _apply_type(obo_ws, rt, _group_levels(groups, personas_of, cells, rt))
-        out.resources_updated += updated
-        out.errors.extend(errors)
+    elif group_ref.lookup_error:
+        out.errors.append(f"{group_ref.lookup_error} Mapping kept; retry the removal.")
+    else:
+        exclude = frozenset({(gid, removed)})
+        groups = {gid: group_ref}
+        personas_of = personas_by_group(session, groups, exclude=exclude)
+        cells = load_cells(session, personas_of[gid])
+        for rt in _acl_types():
+            if rt == GENIE:
+                outcome = _apply_genie(obo_ws, session, groups, actor, exclude=exclude)
+                out.resources_updated += outcome.updated
+                out.table_grants_added += outcome.added
+                out.table_grants_revoked += outcome.revoked
+                out.errors.extend(outcome.errors)
+                out.warnings.extend(outcome.blocked + outcome.warnings)
+                continue
+            updated, errors = _apply_type(obo_ws, rt, _group_levels(groups, personas_of, cells, rt))
+            out.resources_updated += updated
+            out.errors.extend(errors)
+        left = _persona_ledger_rows(session, gid, removed)
+        if left:
+            out.errors.append(
+                f"{len(left)} table grant(s) needed by persona '{removed}' for "
+                f"'{group_ref.name}' could not be released yet (spaces "
+                f"{', '.join(sorted({r.space_id for r in left}))}). Mapping kept; retry the removal."
+            )
+    if not out.errors:
+        session.delete(mapping)
+        session.commit()
+        out.mapping_removed = True
     return out
 
 
@@ -897,23 +938,22 @@ def preview_persona_mapping_removal(
         return out
     exclude = frozenset({(mapping.group_id, mapping.persona)})
     groups = {group_ref.group_id: group_ref}
-    for rt in _types_granted_by(session, mapping.persona):
+    removed_cells = load_cells(session, [mapping.persona])
+    for rt in _acl_types():
         levels, grants, warnings = _preview_type(obo_ws, session, groups, rt, exclude=exclude)
-        out.group_levels.extend(levels)
+        # Show what changes: types the persona grants, anything still granted,
+        # and every Genie row (old persona table grants are released there).
+        if rt == GENIE or removed_cells.grants_anything(mapping.persona, rt) or any(
+            r.effective_level != NONE for r in levels
+        ):
+            out.group_levels.extend(levels)
         out.table_grants.extend(grants)
         out.warnings.extend(warnings)
+    out.warnings.append(
+        "Every supported resource type is recomputed for this group: where no "
+        "remaining persona grants anything, the group's entry is removed."
+    )
     return out
-
-
-def _types_granted_by(session: Session, persona: str) -> list[str]:
-    """Supported resource types where ``persona`` grants anything (type-level
-    cell or any per-resource override)."""
-    cells = load_cells(session, [persona])
-    return [
-        rt.value
-        for rt in ResourceType
-        if rt.value in SUPPORTED_ACL_RESOURCE_TYPES and cells.grants_anything(persona, rt.value)
-    ]
 
 
 def _group_levels(
@@ -938,7 +978,13 @@ def _apply_type(
     errors: list[str] = []
     if not group_levels:
         return 0, errors
-    for resource in list_resources(obo_ws, resource_type):
+    try:
+        resources = list_resources(obo_ws, resource_type)
+    except Exception as e:
+        msg = f"Failed to list {resource_type} resources: {e}"
+        logger.error(msg)
+        return 0, [msg]
+    for resource in resources:
         try:
             # Read-modify-write MERGE: only these groups are changed; existing
             # users, owners, admins, and other groups are preserved.
@@ -957,6 +1003,10 @@ class _GenieOutcome:
         self.added = 0
         self.revoked = 0
         self.errors: list[str] = []
+        # Entries deliberately left untouched (workspace-local group, unreadable
+        # space): errors for Apply, warnings for removal (whose success is
+        # judged by what is left in the ledger instead).
+        self.blocked: list[str] = []
         self.warnings: list[str] = []
 
 
@@ -965,14 +1015,20 @@ def _apply_genie(
     session: Session,
     groups: dict[str, GroupRef],
     actor: str,
+    *,
+    exclude: frozenset[tuple[str, str]] = frozenset(),
 ) -> _GenieOutcome:
     """Per space: grant the tables each group's Genie level needs, write the
     group's effective space ACL, then release table grants nothing needs."""
     out = _GenieOutcome()
-    spaces = list_resources(obo_ws, GENIE)
-    plan = plan_genie(obo_ws, session, groups, spaces)
+    try:
+        spaces = list_resources(obo_ws, GENIE)
+    except Exception as e:
+        out.errors.append(f"Failed to list Genie spaces: {e}")
+        return out
+    plan = plan_genie(obo_ws, session, groups, spaces, exclude=exclude)
     tables = execute_genie_table_grants(obo_ws, session, plan, actor)
-    out.errors.extend(plan.errors)
+    out.blocked.extend(plan.errors)
     for space in spaces:
         levels = plan.acl_levels(space.id)
         if not levels:
@@ -1995,10 +2051,10 @@ def apply_permissions(
             # Per space (overrides), and Genie access always comes WITH the
             # table grants the space needs.
             genie = _apply_genie(obo_ws, session, live, actor)
-            updated, resource_errors = genie.updated, genie.errors
+            updated, resource_errors = genie.updated, genie.blocked + genie.errors
             table_added += genie.added
             table_revoked += genie.revoked
-            table_errors.extend(e for e in genie.errors)
+            table_errors.extend(genie.errors)
             warnings.extend(genie.warnings)
         else:
             updated, resource_errors = _apply_type(

@@ -526,3 +526,162 @@ def test_preview_checks_presence_per_group(session, ws):
     actions = {(g.group_name, g.full_name, g.privilege): g.action for g in out.table_grants}
     assert actions[(GROUP, ORDERS, "SELECT")] == "present"
     assert actions[(HR_GROUP, ORDERS, "SELECT")] == "add"
+
+
+# ═══ Review round: removal is retryable, scope is complete, scoped PG lookup ═══
+
+
+def test_failed_revoke_keeps_last_mapping_and_retry_completes(session, ws):
+    _sales_hr(session)
+    m = _map(session, "sales_analyst")
+    mid = m.id or 0
+    apply_permissions("sales_analyst", ws, session, None, "admin")
+    ws.deny_update.add(("table", ORDERS))  # this revoke will fail
+
+    out = delete_persona_mapping(mid, ws, session, "admin")
+
+    assert not out.mapping_removed and out.errors
+    assert session.get(PersonaGroupMapping, mid) is not None  # kept: retryable
+    assert ws.has("table", ORDERS, "SELECT")
+    assert [r.full_name for r in _rows(session, persona="sales_analyst")] == [ORDERS]
+
+    ws.deny_update.clear()
+    again = delete_persona_mapping(mid, ws, session, "admin")
+
+    assert again.mapping_removed and again.errors == []
+    assert session.get(PersonaGroupMapping, mid) is None
+    assert not ws.has("table", ORDERS, "SELECT") and _rows(session) == []
+
+
+def test_failed_cleanup_keeps_persona_and_retry_deletes_it(session, ws):
+    _sales_hr(session)
+    _map(session, "sales_analyst")
+    apply_permissions("sales_analyst", ws, session, None, "admin")
+    ws.deny_update.add(("table", ORDERS))
+
+    out = delete_persona("sales_analyst", ws, session, "admin")
+
+    assert out["status"] == "incomplete" and not out["persona_deleted"]
+    defn = session.exec(select(PersonaDefinition).where(PersonaDefinition.key == "sales_analyst")).first()
+    assert defn is not None
+    assert session.exec(select(PersonaGroupMapping)).all() != []
+    assert session.exec(select(PersonaResourceOverride)).all() != []  # overrides kept too
+
+    ws.deny_update.clear()
+    out = delete_persona("sales_analyst", ws, session, "admin")
+
+    assert out["status"] == "ok" and out["persona_deleted"]
+    assert session.exec(select(PersonaGroupMapping)).all() == []
+    assert not ws.has("table", ORDERS, "SELECT") and _rows(session) == []
+
+
+@pytest.mark.parametrize("still_needed_by", ["nothing", "persona", "bundle", "pre-existing"])
+def test_removal_releases_old_grants_even_if_cell_is_now_none(session, ws, still_needed_by):
+    """The persona was applied with Sales = CAN_RUN, then its cell was lowered to
+    NO_PERMISSIONS WITHOUT an Apply. Removing it must still release its old
+    table grants, keeping only what something else needs."""
+    _sales_hr(session)
+    m = _map(session, "sales_analyst")
+    if still_needed_by == "pre-existing":
+        ws.uc[("table", ORDERS)] = {GROUP: {"SELECT"}}
+    apply_permissions("sales_analyst", ws, session, None, "admin")
+    if still_needed_by == "persona":
+        _persona(session, "other", {GENIE: NONE}, {SALES: CAN_READ})
+        _map(session, "other")
+        apply_permissions("other", ws, session, None, "admin")
+    if still_needed_by == "bundle":
+        _apply(ws, session, _bundle(session))
+    o = session.exec(select(PersonaResourceOverride).where(PersonaResourceOverride.persona == "sales_analyst")).one()
+    o.permission_level = NONE  # lowered, never applied
+    session.add(o)
+    session.commit()
+    assert _rows(session, persona="sales_analyst")  # old rows still there
+
+    out = delete_persona_mapping(m.id or 0, ws, session, "admin")
+
+    assert out.mapping_removed, out.errors
+    assert _rows(session, persona="sales_analyst") == []
+    kept = still_needed_by != "nothing"
+    assert ws.has("table", ORDERS, "SELECT") == kept
+    if still_needed_by == "nothing":
+        assert ws.level(SALES) is None and not ws.has("catalog", CAT, "USE_CATALOG")
+    if still_needed_by == "pre-existing":
+        assert not ws.has("table", REVENUE, "SELECT")  # app-made ones still revoked
+
+
+def test_removal_recomputes_previously_applied_non_genie_types(session, ws):
+    _persona(session, "ops", {CLUSTERS: PermissionLevel.CAN_RESTART.value, GENIE: NONE})
+    m = _map(session, "ops")
+    calls = []
+    clusters = [ResourceItemOut(id="c1", name="c1", resource_type=CLUSTERS)]
+
+    def fake_list(_w, rt):
+        return clusters if rt == CLUSTERS else (ws.spaces() if rt == GENIE else [])
+
+    with patch("permissions_app.backend.router.list_resources", side_effect=fake_list), patch(
+        "permissions_app.backend.router.apply_group_acl",
+        side_effect=lambda _w, rt, rid, levels: calls.append((rt, rid, dict(levels))),
+    ):
+        apply_permissions("ops", ws, session, None, "admin")
+        assert (CLUSTERS, "c1", {GROUP: "CAN_RESTART"}) in calls
+        # Cell lowered without Apply: the persona "grants nothing" now, but the
+        # group still holds CAN_RESTART from the earlier Apply.
+        t = session.exec(select(PermissionTemplate).where(PermissionTemplate.persona == "ops")).all()
+        for row in t:
+            row.permission_level = NONE
+            session.add(row)
+        session.commit()
+        calls.clear()
+        out = delete_persona_mapping(m.id or 0, ws, session, "admin")
+
+    assert out.mapping_removed
+    assert (CLUSTERS, "c1", {GROUP: NONE}) in calls
+
+
+@pytest.mark.skipif(not PG_URL, reason="set UCG_TEST_PG_URL to run Postgres tests")
+def test_pg_constraint_lookup_is_scoped_to_the_ledger_table():
+    """Same-named constraints on an unrelated table (same schema) and in another
+    schema must not make the migration skip adding the ledger's constraints."""
+    from permissions_app.backend.models import (
+        GENIE_LEDGER_GROUP_ID_CHECK,
+        GENIE_LEDGER_SOURCE_CHECK,
+        GENIE_LEDGER_SOURCE_UNIQUE,
+    )
+    from permissions_app.backend.seed import ensure_genie_bundle_schema
+    from permissions_app.tests.test_genie_bundles import _v1_schema
+
+    engine = create_engine(PG_URL or "")
+    SQLModel.metadata.drop_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS decoy_local"))
+        conn.execute(text("DROP SCHEMA IF EXISTS decoy CASCADE"))
+        conn.execute(text(
+            "CREATE TABLE decoy_local (id INT, source VARCHAR, group_id VARCHAR,"
+            f" CONSTRAINT {GENIE_LEDGER_SOURCE_CHECK} CHECK (source <> ''),"
+            f" CONSTRAINT {GENIE_LEDGER_GROUP_ID_CHECK} CHECK (group_id <> ''))"
+        ))
+        conn.execute(text("CREATE SCHEMA decoy"))
+        conn.execute(text(
+            "CREATE TABLE decoy.t (a INT, b INT, c INT, d INT, e INT,"
+            f" CONSTRAINT {GENIE_LEDGER_SOURCE_UNIQUE} UNIQUE (a, b, c, d, e))"
+        ))
+    _v1_schema(engine)  # pre-source / pre-group_id ledger
+    for _ in range(2):  # idempotent
+        with engine.begin() as conn:
+            ensure_genie_bundle_schema(conn)
+
+    with engine.connect() as conn:
+        on_ledger = set(conn.execute(text(
+            "SELECT conname FROM pg_constraint WHERE conrelid = 'genie_grant_ledger'::regclass"
+        )).scalars().all())
+    assert {GENIE_LEDGER_SOURCE_CHECK, GENIE_LEDGER_SOURCE_UNIQUE, GENIE_LEDGER_GROUP_ID_CHECK} <= on_ledger
+    with Session(engine) as s:  # the constraints really are enforced
+        s.add(GenieGrantLedger(source="", bundle_id=1, group_id="g", space_id="s", principal="p",
+                               securable_type="table", full_name="c.s.t", privilege="SELECT"))
+        with pytest.raises(IntegrityError, match=GENIE_LEDGER_SOURCE_CHECK):
+            s.commit()
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE decoy_local"))
+        conn.execute(text("DROP SCHEMA decoy CASCADE"))
+    SQLModel.metadata.drop_all(engine)
+    engine.dispose()

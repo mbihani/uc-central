@@ -710,6 +710,8 @@ class GroupResyncOut(BaseModel):
     group_id: str
     group_name: str
     removed_persona: str
+    # False = cleanup failed; the mapping was KEPT and the removal can be retried.
+    mapping_removed: bool = False
     resources_updated: int = 0
     table_grants_added: int = 0
     table_grants_revoked: int = 0
