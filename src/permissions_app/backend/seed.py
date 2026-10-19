@@ -17,7 +17,7 @@ time; the ON CONFLICT seeding here is the belt-and-suspenders that keeps the
 lazy per-request seed paths (``router._seed_*``) safe as well.
 """
 
-from sqlalchemy import Connection, inspect, text
+from sqlalchemy import Connection, Table, inspect, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, SQLModel
 
@@ -28,7 +28,14 @@ from .models import (
     DEFAULT_PERSONA_LABELS,
     GENIE_BUNDLE_SPACE_UNIQUE,
     GENIE_LEDGER_GROUP_ID_CHECK,
+    GENIE_LEDGER_SOURCE_CHECK,
+    GENIE_LEDGER_SOURCE_UNIQUE,
     LEDGER_CONFIRMED,
+    LEGACY_LEDGER_UNIQUE,
+    LEGACY_PERSONA_GROUP_UNIQUE,
+    PERSONA_GROUP_UNIQUE,
+    PersonaGroupMapping,
+    PersonaResourceOverride,
     DefaultPersona,
     GenieAccessBundle,
     GenieGrantLedger,
@@ -51,9 +58,12 @@ _UNIQUE_CONSTRAINTS: list[tuple[str, tuple[str, ...], str]] = [
         "uq_permission_template_persona_resource_type",
     ),
     (
+        # Personas STACK: a group may map to several personas, but each
+        # (group, persona) pair once. The pre-stacking UNIQUE (group_id) is
+        # dropped by ensure_persona_stacking_schema.
         "persona_group_mapping",
-        ("group_id",),
-        "uq_persona_group_mapping_group_id",
+        ("group_id", "persona"),
+        PERSONA_GROUP_UNIQUE,
     ),
     (
         "persona_user_mapping",
@@ -144,6 +154,148 @@ def ensure_unique_constraints(conn: Connection) -> None:
         logger.info(f"Added UNIQUE constraint {name} on {table}({', '.join(cols)})")
 
 
+def _sqlite_table_sql(conn: Connection, table: str) -> str:
+    row = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :t"),
+        {"t": table},
+    ).first()
+    return (row[0] or "") if row else ""
+
+
+def _sqlite_rebuild(conn: Connection, table: Table) -> None:
+    """Recreate ``table`` from the current model and copy its rows (SQLite
+    cannot drop or alter constraints in place). Every column the model and the
+    old table share is copied unchanged; nothing is dropped. Callers run their
+    validations BEFORE calling this.
+
+    SQLite is the test / local-dev backend only; production runs Postgres,
+    whose path uses in-place ALTERs inside the bootstrap transaction.
+    """
+    name = table.name
+    tmp = f"{name}__pre_migration"
+    old_cols = {c["name"] for c in inspect(conn).get_columns(name)}
+    # Index names are database-global in SQLite: drop the old table's explicit
+    # indexes so the new table can recreate them (auto-indexes go with it).
+    for (idx,) in conn.execute(
+        text(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :t "
+            "AND sql IS NOT NULL"
+        ),
+        {"t": name},
+    ).all():
+        conn.execute(text(f'DROP INDEX "{idx}"'))
+    conn.execute(text(f'ALTER TABLE "{name}" RENAME TO "{tmp}"'))
+    table.create(conn)
+    cols = ", ".join(f'"{c.name}"' for c in table.columns if c.name in old_cols)
+    conn.execute(text(f'INSERT INTO "{name}" ({cols}) SELECT {cols} FROM "{tmp}"'))
+    conn.execute(text(f'DROP TABLE "{tmp}"'))
+    logger.info(f"Rebuilt SQLite table {name} with the current constraints")
+
+
+def ensure_persona_stacking_schema(conn: Connection) -> None:
+    """Allow a group to map to SEVERAL personas, and add per-resource overrides.
+
+    Idempotent on a fresh database and on one created before stacking:
+
+      * the per-resource override table is created if missing;
+      * the pre-stacking ``UNIQUE (group_id)`` on ``persona_group_mapping`` is
+        dropped; ``UNIQUE (group_id, persona)`` remains (Postgres: added by
+        ``ensure_unique_constraints``; fresh/rebuilt tables: from the model).
+        No mapping row is changed or deleted.
+    """
+    SQLModel.metadata.create_all(
+        conn,
+        tables=[SQLModel.metadata.tables[PersonaResourceOverride.__tablename__]],
+        checkfirst=True,
+    )
+    table = PersonaGroupMapping.__tablename__
+    if conn.dialect.name == "postgresql":
+        conn.execute(
+            text(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {LEGACY_PERSONA_GROUP_UNIQUE}")
+        )
+        return
+    if LEGACY_PERSONA_GROUP_UNIQUE in _sqlite_table_sql(conn, table):
+        _sqlite_rebuild(conn, SQLModel.metadata.tables[table])
+
+
+def _upgrade_ledger_sources(conn: Connection) -> None:
+    """Give every ledger row a SOURCE ("bundle:<id>" or "persona:<k>:space:<id>").
+
+    Refcounting compares sources for the same group id, so bundles and personas
+    can rely on the same UC grant and only the last one releases it. Rows from
+    earlier versions all came from bundles and are backfilled to
+    ``bundle:<bundle_id>``. The uniqueness key moves from (bundle, principal,
+    grant) to (source, group_id, grant); ``bundle_id`` becomes optional
+    (persona rows have none). Fails loudly, changing nothing, if a row cannot
+    be given a source or the new key would be violated.
+    """
+    ledger = GenieGrantLedger.__tablename__
+    cols = {c["name"] for c in inspect(conn).get_columns(ledger)}
+    if "source" not in cols:
+        conn.execute(text(f"ALTER TABLE {ledger} ADD COLUMN source VARCHAR NOT NULL DEFAULT ''"))
+        logger.info(f"Added column {ledger}.source")
+    if "persona" not in cols:
+        conn.execute(text(f"ALTER TABLE {ledger} ADD COLUMN persona VARCHAR"))
+    conn.execute(
+        text(
+            f"UPDATE {ledger} SET source = 'bundle:' || CAST(bundle_id AS VARCHAR) "
+            f"WHERE (source IS NULL OR source = '') AND bundle_id IS NOT NULL"
+        )
+    )
+    unsourced = conn.execute(
+        text(f"SELECT id FROM {ledger} WHERE source IS NULL OR source = '' ORDER BY id")
+    ).scalars().all()
+    if unsourced:
+        raise RuntimeError(
+            f"{len(unsourced)} {ledger} row(s) have neither a source nor a bundle id: "
+            f"rows {list(unsourced)}. Nothing was changed or deleted; set their source "
+            f"and restart."
+        )
+    dups = conn.execute(
+        text(
+            f"SELECT source, group_id, securable_type, full_name, privilege, COUNT(*) "
+            f"FROM {ledger} GROUP BY source, group_id, securable_type, full_name, privilege "
+            f"HAVING COUNT(*) > 1"
+        )
+    ).all()
+    if dups:
+        raise RuntimeError(
+            f"{len(dups)} duplicate {ledger} grant(s) per (source, group): "
+            f"{[tuple(d[:5]) for d in dups]}. Nothing was changed or deleted."
+        )
+
+    if conn.dialect.name == "postgresql":
+        conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN source DROP DEFAULT"))
+        conn.execute(text(f"ALTER TABLE {ledger} ALTER COLUMN bundle_id DROP NOT NULL"))
+        conn.execute(text(f"ALTER TABLE {ledger} DROP CONSTRAINT IF EXISTS {LEGACY_LEDGER_UNIQUE}"))
+        existing = set(
+            conn.execute(
+                text("SELECT conname FROM pg_constraint WHERE conname IN (:a, :b)"),
+                {"a": GENIE_LEDGER_SOURCE_CHECK, "b": GENIE_LEDGER_SOURCE_UNIQUE},
+            ).scalars().all()
+        )
+        if GENIE_LEDGER_SOURCE_CHECK not in existing:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {ledger} ADD CONSTRAINT {GENIE_LEDGER_SOURCE_CHECK} "
+                    f"CHECK (source <> '')"
+                )
+            )
+        if GENIE_LEDGER_SOURCE_UNIQUE not in existing:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {ledger} ADD CONSTRAINT {GENIE_LEDGER_SOURCE_UNIQUE} "
+                    f"UNIQUE (source, group_id, securable_type, full_name, privilege)"
+                )
+            )
+    elif GENIE_LEDGER_SOURCE_UNIQUE not in _sqlite_table_sql(conn, ledger):
+        _sqlite_rebuild(conn, SQLModel.metadata.tables[ledger])
+    for col_name in ("source", "persona"):
+        conn.execute(
+            text(f"CREATE INDEX IF NOT EXISTS ix_{ledger}_{col_name} ON {ledger} ({col_name})")
+        )
+
+
 def ensure_genie_bundle_schema(conn: Connection) -> None:
     """Create / upgrade the Genie access bundle + grant ledger tables.
 
@@ -162,6 +314,7 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
         bundle ids, deleting nothing. On Postgres the transitional '' default is
         then dropped and a non-empty CHECK added (fresh DBs get both from the
         model).
+      * every row gets a ``source`` (see ``_upgrade_ledger_sources``).
       * the one-bundle-per-space UNIQUE index is created if missing. If the DB
         already holds several bundles for one space the migration FAILS LOUDLY
         (RuntimeError, aborting startup) naming them, rather than silently
@@ -242,6 +395,7 @@ def ensure_genie_bundle_schema(conn: Connection) -> None:
     conn.execute(
         text(f"CREATE INDEX IF NOT EXISTS ix_{ledger}_group_id ON {ledger} (group_id)")
     )
+    _upgrade_ledger_sources(conn)
 
     if GENIE_BUNDLE_SPACE_UNIQUE not in {i["name"] for i in insp.get_indexes(bundles)}:
         dups = conn.execute(

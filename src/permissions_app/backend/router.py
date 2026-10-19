@@ -6,10 +6,11 @@ from databricks.sdk.service import iam
 from databricks.sdk.service.iam import User as DatabricksUserOut
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from .._metadata import api_prefix
 from .dependencies import (
+    ActorDep,
     AdminRequired,
     CurrentUserDep,
     SessionDep,
@@ -19,7 +20,15 @@ from .dependencies import (
 )
 from .logger import logger
 from .models import (
+    OVERRIDABLE_RESOURCE_TYPES,
     AddMemberIn,
+    GroupLevelOut,
+    GroupResyncOut,
+    GroupResyncPreviewOut,
+    PermissionOverrideIn,
+    PermissionOverrideOut,
+    PersonaResourceOverride,
+    TableGrantPlanOut,
     ApplyAllResultOut,
     ApplyPermissionsIn,
     ApplyPlanItemOut,
@@ -62,6 +71,21 @@ from .models import (
     get_higher_permission,
     get_permission_rank,
     is_permission_level_allowed,
+)
+from .persona_sync import (
+    GENIE,
+    NONE,
+    GroupRef,
+    PersonaCells,
+    execute_genie_table_grants,
+    genie_level_rows,
+    group_effective,
+    load_cells,
+    personas_by_group,
+    plan_genie,
+    release_stale_table_grants,
+    resolve_groups,
+    table_grant_rows,
 )
 from .resources import SUPPORTED_ACL_RESOURCE_TYPES, apply_group_acl, apply_user_acl, list_resources
 from .seed import seed_permission_templates, seed_persona_definitions
@@ -696,6 +720,14 @@ def delete_persona(persona_key: str, session: SessionDep, _admin: AdminRequired 
     for t in templates:
         session.delete(t)
 
+    for o in session.exec(
+        select(PersonaResourceOverride).where(PersonaResourceOverride.persona == persona_key)
+    ).all():
+        session.delete(o)
+
+    # NOTE: no workspace writes here (unchanged behaviour). Table grants this
+    # persona sourced stay in the ledger and are released by the next persona
+    # Apply / removal for those groups, since the persona no longer maps them.
     session.delete(defn)
     session.commit()
 
@@ -723,10 +755,11 @@ def create_persona_mapping(
             detail=f"Persona '{body.persona}' does not exist.",
         )
 
-    # Check if this group is already mapped
+    # Personas stack: a group may map to several personas, each once.
     existing = session.exec(
         select(PersonaGroupMapping).where(
-            PersonaGroupMapping.group_id == body.group_id
+            PersonaGroupMapping.group_id == body.group_id,
+            PersonaGroupMapping.persona == body.persona,
         )
     ).first()
     if existing:
@@ -757,14 +790,223 @@ def create_persona_mapping(
     response_model=dict,
     operation_id="deletePersonaMapping",
 )
-def delete_persona_mapping(mapping_id: int, session: SessionDep, _admin: AdminRequired = True):
-    """Remove a persona-group mapping."""
+def delete_persona_mapping(
+    mapping_id: int,
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    session: SessionDep,
+    actor: ActorDep = "",
+    _admin: AdminRequired = True,
+):
+    """Remove a persona from a group, then RECOMPUTE that group's access from
+    its remaining personas (and applied bundles).
+
+    Only resource types where the removed persona granted something are
+    touched: each resource's entry for the group is set to the remaining
+    effective level (removed only when nothing else grants it), and Genie table
+    grants this persona sourced are released — revoked only if the app made
+    them and no remaining persona / bundle still needs them.
+    """
     mapping = session.get(PersonaGroupMapping, mapping_id)
     if not mapping:
         raise HTTPException(status_code=404, detail="Mapping not found")
+    removed = mapping.persona
+    affected = _types_granted_by(session, removed)
+    group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
     session.delete(mapping)
     session.commit()
-    return {"status": "ok", "message": "Mapping deleted"}
+
+    out = GroupResyncOut(
+        group_id=group_ref.group_id, group_name=group_ref.name, removed_persona=removed
+    )
+    if group_ref.missing:
+        out.warnings.append(
+            f"Group id {group_ref.group_id} no longer exists; mapping removed, nothing recomputed."
+        )
+        return out
+    groups = {group_ref.group_id: group_ref}
+    personas_of = personas_by_group(session, groups)
+    cells = load_cells(session, personas_of[group_ref.group_id])
+    for rt in affected:
+        if rt == GENIE:
+            outcome = _apply_genie(obo_ws, session, groups, actor)
+            out.resources_updated += outcome.updated
+            out.table_grants_added += outcome.added
+            out.table_grants_revoked += outcome.revoked
+            out.errors.extend(outcome.errors)
+            out.warnings.extend(outcome.warnings)
+            continue
+        updated, errors = _apply_type(obo_ws, rt, _group_levels(groups, personas_of, cells, rt))
+        out.resources_updated += updated
+        out.errors.extend(errors)
+    return out
+
+
+@api.get(
+    "/personas/mappings/{mapping_id}/removal-preview",
+    response_model=GroupResyncPreviewOut,
+    operation_id="previewPersonaMappingRemoval",
+)
+def preview_persona_mapping_removal(
+    mapping_id: int,
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    session: SessionDep,
+    _admin: AdminRequired = True,
+):
+    """Read-only: what removing this persona from the group would change."""
+    mapping = session.get(PersonaGroupMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+    group_ref = resolve_groups(obo_ws, [mapping])[mapping.group_id]
+    out = GroupResyncPreviewOut(
+        group_id=group_ref.group_id, group_name=group_ref.name, removed_persona=mapping.persona
+    )
+    if group_ref.missing:
+        out.warnings.append(f"Group id {group_ref.group_id} no longer exists.")
+        return out
+    exclude = frozenset({(mapping.group_id, mapping.persona)})
+    groups = {group_ref.group_id: group_ref}
+    for rt in _types_granted_by(session, mapping.persona):
+        levels, grants, warnings = _preview_type(obo_ws, session, groups, rt, exclude=exclude)
+        out.group_levels.extend(levels)
+        out.table_grants.extend(grants)
+        out.warnings.extend(warnings)
+    return out
+
+
+def _types_granted_by(session: Session, persona: str) -> list[str]:
+    """Supported resource types where ``persona`` grants anything (type-level
+    cell or any per-resource override)."""
+    cells = load_cells(session, [persona])
+    return [
+        rt.value
+        for rt in ResourceType
+        if rt.value in SUPPORTED_ACL_RESOURCE_TYPES and cells.grants_anything(persona, rt.value)
+    ]
+
+
+def _group_levels(
+    groups: dict[str, GroupRef],
+    personas_of: dict[str, list[str]],
+    cells: PersonaCells,
+    resource_type: str,
+) -> dict[str, str]:
+    """group CURRENT name -> effective (highest) level across its personas."""
+    return {
+        ref.name: group_effective(cells, personas_of.get(gid, []), resource_type).level
+        for gid, ref in groups.items()
+        if not ref.missing
+    }
+
+
+def _apply_type(
+    obo_ws: WorkspaceClient, resource_type: str, group_levels: dict[str, str]
+) -> tuple[int, list[str]]:
+    """Merge-apply ``group_levels`` onto every resource of a (non-Genie) type."""
+    updated = 0
+    errors: list[str] = []
+    if not group_levels:
+        return 0, errors
+    for resource in list_resources(obo_ws, resource_type):
+        try:
+            # Read-modify-write MERGE: only these groups are changed; existing
+            # users, owners, admins, and other groups are preserved.
+            apply_group_acl(obo_ws, resource_type, resource.id, group_levels)
+            updated += 1
+        except Exception as e:
+            msg = f"Failed to set permissions on {resource.name} ({resource.id}): {str(e)}"
+            logger.error(msg)
+            errors.append(msg)
+    return updated, errors
+
+
+class _GenieOutcome:
+    def __init__(self) -> None:
+        self.updated = 0
+        self.added = 0
+        self.revoked = 0
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+
+def _apply_genie(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    groups: dict[str, GroupRef],
+    actor: str,
+) -> _GenieOutcome:
+    """Per space: grant the tables each group's Genie level needs, write the
+    group's effective space ACL, then release table grants nothing needs."""
+    out = _GenieOutcome()
+    spaces = list_resources(obo_ws, GENIE)
+    plan = plan_genie(obo_ws, session, groups, spaces)
+    tables = execute_genie_table_grants(obo_ws, session, plan, actor)
+    out.errors.extend(plan.errors)
+    for space in spaces:
+        levels = plan.acl_levels(space.id)
+        if not levels:
+            continue
+        try:
+            apply_group_acl(obo_ws, GENIE, space.id, levels)
+            out.updated += 1
+        except Exception as e:
+            msg = f"Failed to set permissions on {space.name} ({space.id}): {str(e)}"
+            logger.error(msg)
+            out.errors.append(msg)
+    release_stale_table_grants(obo_ws, session, plan, tables)
+    out.added = len(tables.granted)
+    out.revoked = len(tables.revoked)
+    out.errors.extend(tables.errors)
+    out.warnings.extend(plan.warnings + tables.warnings)
+    return out
+
+
+def _preview_type(
+    obo_ws: WorkspaceClient,
+    session: Session,
+    groups: dict[str, GroupRef],
+    resource_type: str,
+    *,
+    exclude: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[list[GroupLevelOut], list[TableGrantPlanOut], list[str]]:
+    """Read-only per-group effective levels (+ Genie table grants) for a type."""
+    live = {gid: r for gid, r in groups.items() if not r.missing}
+    if resource_type == GENIE:
+        plan = plan_genie(obo_ws, session, live, list_resources(obo_ws, GENIE), exclude=exclude)
+        return genie_level_rows(plan), table_grant_rows(obo_ws, session, plan), plan.warnings
+    personas_of = personas_by_group(session, live, exclude=exclude)
+    cells = load_cells(session, [p for ps in personas_of.values() for p in ps])
+    rows = []
+    for gid, ref in live.items():
+        eff = group_effective(cells, personas_of[gid], resource_type)
+        rows.append(
+            GroupLevelOut(
+                group_id=gid,
+                group_name=ref.name,
+                resource_type=resource_type,
+                resource_type_label=_resource_type_label(resource_type),
+                effective_level=eff.level,
+                granted_by=eff.granted_by,
+                source_levels=eff.source_levels,
+                escalation=eff.escalation,
+                escalation_detail=eff.escalation_detail,
+            )
+        )
+    return rows, [], []
+
+
+def _persist_group_renames(session: Session, groups: dict[str, GroupRef]) -> None:
+    """Groups are identified by id; refresh the stored display names of every
+    mapping of a group that was renamed (mutating paths only)."""
+    renamed = {gid: r.name for gid, r in groups.items() if not r.missing and r.name != r.stored_name}
+    if not renamed:
+        return
+    for m in session.exec(
+        select(PersonaGroupMapping).where(col(PersonaGroupMapping.group_id).in_(sorted(renamed)))
+    ).all():
+        if m.group_id in renamed and m.group_name != renamed[m.group_id]:
+            m.group_name = renamed[m.group_id]
+            session.add(m)
+    session.commit()
 
 
 # ─── Persona User Mappings ────────────────────────────────────────────────────
@@ -1100,7 +1342,75 @@ def get_permission_matrix(session: SessionDep, _admin: AdminRequired = True):
             r.value: [pl.value for pl in RESOURCE_PERMISSION_LEVELS[r]]
             for r in ResourceType
         },
+        overrides=[_override_out(o) for o in session.exec(select(PersonaResourceOverride)).all()],
+        overridable_resource_types=sorted(OVERRIDABLE_RESOURCE_TYPES),
     )
+
+
+def _override_out(o: PersonaResourceOverride) -> PermissionOverrideOut:
+    return PermissionOverrideOut(
+        id=o.id or 0,
+        persona=o.persona,
+        resource_type=o.resource_type,
+        resource_id=o.resource_id,
+        permission_level=o.permission_level,
+    )
+
+
+@api.put(
+    "/permissions/matrix/overrides",
+    response_model=list[PermissionOverrideOut],
+    operation_id="setPermissionOverride",
+)
+def set_permission_override(
+    body: PermissionOverrideIn, session: SessionDep, _admin: AdminRequired = True
+):
+    """Set a persona's level on ONE resource (e.g. one Genie space), replacing
+    its "all resources" cell there; ``permission_level: null`` clears it.
+    Returns that persona's overrides. Nothing is written to the workspace until
+    the persona is applied."""
+    rt = body.resource_type.value
+    if rt not in OVERRIDABLE_RESOURCE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Per-resource levels are only supported for: "
+                f"{', '.join(sorted(OVERRIDABLE_RESOURCE_TYPES))}."
+            ),
+        )
+    if not body.resource_id.strip():
+        raise HTTPException(status_code=400, detail="resource_id is required.")
+    if not session.exec(
+        select(PersonaDefinition).where(PersonaDefinition.key == body.persona)
+    ).first():
+        raise HTTPException(status_code=404, detail=f"Persona '{body.persona}' not found")
+    existing = session.exec(
+        select(PersonaResourceOverride).where(
+            PersonaResourceOverride.persona == body.persona,
+            PersonaResourceOverride.resource_type == rt,
+            PersonaResourceOverride.resource_id == body.resource_id,
+        )
+    ).first()
+    if body.permission_level is None:
+        if existing is not None:
+            session.delete(existing)
+    else:
+        _assert_level_allowed(rt, body.permission_level.value)
+        if existing is None:
+            existing = PersonaResourceOverride(
+                persona=body.persona, resource_type=rt, resource_id=body.resource_id,
+                permission_level=body.permission_level.value,
+            )
+        else:
+            existing.permission_level = body.permission_level.value
+        session.add(existing)
+    session.commit()
+    return [
+        _override_out(o)
+        for o in session.exec(
+            select(PersonaResourceOverride).where(PersonaResourceOverride.persona == body.persona)
+        ).all()
+    ]
 
 
 @api.put(
@@ -1171,12 +1481,13 @@ def check_permission_conflicts(
             total_users_checked=0, users_with_conflicts=0, conflicts=[]
         )
 
-    # Build group_name -> persona lookup
-    group_name_to_persona: dict[str, str] = {}
+    # Build group_name -> personas lookup (personas stack: a group may map to
+    # several personas).
+    group_name_to_personas: dict[str, set[str]] = {}
     for m in mappings:
-        group_name_to_persona[m.group_name] = m.persona
+        group_name_to_personas.setdefault(m.group_name, set()).add(m.persona)
 
-    mapped_group_names = set(group_name_to_persona.keys())
+    mapped_group_names = set(group_name_to_personas.keys())
 
     # 2. Get the full permission template matrix
     templates = session.exec(select(PermissionTemplate)).all()
@@ -1221,9 +1532,7 @@ def check_permission_conflicts(
         # Find which personas this user has through their groups
         user_personas: set[str] = set()
         for gname in user_mapped_groups:
-            persona = group_name_to_persona.get(gname)
-            if persona:
-                user_personas.add(persona)
+            user_personas.update(group_name_to_personas.get(gname, set()))
 
         if len(user_personas) < 2:
             continue  # No conflict possible with a single persona
@@ -1292,24 +1601,33 @@ def _resource_type_label(resource_type: str) -> str:
 def _compute_apply_plan(
     obo_ws: WorkspaceClient,
     templates,
-) -> tuple[list[ApplyPlanItemOut], list[ApplyPlanSkippedOut]]:
-    """Compute the DRY-RUN plan for applying a persona — makes ZERO ACL writes.
+    session: Session | None = None,
+    groups: dict[str, GroupRef] | None = None,
+) -> tuple[list[ApplyPlanItemOut], list[ApplyPlanSkippedOut], list[GroupLevelOut], list[TableGrantPlanOut], list[str]]:
+    """Compute the DRY-RUN plan for applying a persona — ZERO workspace or DB writes.
 
-    This is the read-only twin of the write loop in ``apply_permissions``: it
-    mirrors that loop's per-type branching EXACTLY so the preview never lies
-    about what a real apply would do —
+    The read-only twin of the write loop in ``apply_permissions``, mirroring its
+    per-type branching so the preview never lies about what a real apply does:
 
       * unsupported type (no lister) -> skipped (``unsupported``);
-      * ``NO_PERMISSIONS`` level     -> skipped (``no_permissions``, a no-op/revoke);
-      * type-invalid level          -> skipped (``invalid_level``);
-      * otherwise                    -> a plan row with the LIVE resource count.
+      * type-invalid level           -> skipped (``invalid_level``);
+      * no mapped group ends up with any level (no persona grants anything)
+                                      -> skipped (``no_permissions``);
+      * otherwise                     -> a plan row with the LIVE resource count
+        and the highest effective level.
 
-    The only workspace calls made here are ``list_resources`` reads (to count how
-    many resources of each planned type exist); it NEVER calls ``apply_group_acl``
-    / ``permissions.set``.
+    Plus the least-privilege detail: per group and object, the EFFECTIVE level
+    and which personas / bundles grant it (with escalation flags), and the Genie
+    table grants that would be added / kept / revoked (with row-filter / mask
+    status). Reads only (``list_resources``, group / space / table lookups,
+    effective-grant reads); it NEVER calls ``apply_group_acl`` or ``grants.update``.
     """
     plan: list[ApplyPlanItemOut] = []
     skipped: list[ApplyPlanSkippedOut] = []
+    level_rows: list[GroupLevelOut] = []
+    grant_rows: list[TableGrantPlanOut] = []
+    warnings: list[str] = []
+    groups = groups or {}
 
     for template in templates:
         level = template.permission_level
@@ -1334,17 +1652,6 @@ def _compute_apply_plan(
             )
             continue
 
-        if level == PermissionLevel.NO_PERMISSIONS.value:
-            skipped.append(
-                ApplyPlanSkippedOut(
-                    resource_type=rt,
-                    resource_type_label=label,
-                    target_level=level,
-                    reason="no_permissions",
-                )
-            )
-            continue
-
         if not is_permission_level_allowed(rt, level):
             skipped.append(
                 ApplyPlanSkippedOut(
@@ -1356,18 +1663,41 @@ def _compute_apply_plan(
             )
             continue
 
-        # Read-only: count how many resources of this type would be rewritten.
-        count = len(list_resources(obo_ws, rt))
+        if session is not None and groups:
+            rows, grants, warns = _preview_type(obo_ws, session, groups, rt)
+            level_rows.extend(rows)
+            grant_rows.extend(grants)
+            warnings.extend(warns)
+            effective = [r.effective_level for r in rows if r.effective_level != NONE]
+        else:
+            rows, effective = [], ([level] if level != NONE else [])
+
+        if not effective:
+            skipped.append(
+                ApplyPlanSkippedOut(
+                    resource_type=rt,
+                    resource_type_label=label,
+                    target_level=PermissionLevel.NO_PERMISSIONS.value,
+                    reason="no_permissions",
+                )
+            )
+            continue
+
+        if rt == GENIE and rows:
+            count = len({r.resource_id for r in rows if not r.blocked})
+        else:
+            # Read-only: count how many resources of this type would be rewritten.
+            count = len(list_resources(obo_ws, rt))
         plan.append(
             ApplyPlanItemOut(
                 resource_type=rt,
                 resource_type_label=label,
-                target_level=level,
+                target_level=get_higher_permission(rt, *effective),
                 resource_count=count,
             )
         )
 
-    return plan, skipped
+    return plan, skipped, level_rows, grant_rows, sorted(set(warnings))
 
 
 @api.get(
@@ -1382,7 +1712,7 @@ def preview_apply_permissions(
     _admin: AdminRequired = True,
 ):
     """DRY-RUN preview of applying a persona's template — computes the blast
-    radius per resource type WITHOUT writing any ACL.
+    radius per resource type WITHOUT writing anything (workspace or database).
 
     Returns, for every resource type the real apply WOULD write, the target
     level and how many live workspace resources of that type would be affected;
@@ -1416,7 +1746,21 @@ def preview_apply_permissions(
     # iterate zero templates that have mappings, producing an all-skipped plan.
     # The real apply handles the no-groups case identically (the group_levels
     # dict is empty, so it emits a zero-updated ApplyResultOut per type).
-    plan, skipped = _compute_apply_plan(obo_ws, templates if mappings else [])
+    groups = resolve_groups(obo_ws, mappings)
+    plan, skipped, level_rows, grant_rows, warnings = _compute_apply_plan(
+        obo_ws, templates if mappings else [], session, groups
+    )
+    warnings = [
+        f"Group id {r.group_id} ('{r.stored_name}') no longer exists; Apply will skip it."
+        for r in groups.values()
+        if r.missing
+    ] + warnings
+    filtered = [o for o in grant_rows if o.has_row_filter or o.masked_columns]
+    if filtered:
+        warnings.append(
+            f"{len({o.full_name for o in filtered})} table(s) to be granted already have a "
+            f"row filter or column mask; check what members of the group will see."
+        )
 
     direct_user_count = len(
         session.exec(
@@ -1432,6 +1776,10 @@ def preview_apply_permissions(
         skipped=skipped,
         total_resources_affected=sum(p.resource_count for p in plan),
         direct_user_count=direct_user_count,
+        group_levels=level_rows,
+        table_grants=grant_rows,
+        escalation_count=sum(1 for r in level_rows if r.escalation),
+        warnings=warnings,
     )
 
 
@@ -1445,15 +1793,16 @@ def apply_permissions(
     obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     session: SessionDep,
     body: ApplyPermissionsIn | None = None,
+    actor: ActorDep = "",
     _admin: AdminRequired = True,
 ):
     """Apply the persona's template permissions to resources in the workspace.
 
     By default this covers ALL resource types in the persona's template. Supply
     an optional body ``{"resource_types": [...]}`` to SCOPE the apply to only
-    those types (blast-radius reduction) — each mapped group is still set to THIS
-    persona's own template level for the type; omitting the body / field
-    preserves the original all-types behaviour.
+    those types (blast-radius reduction); omitting the body / field preserves
+    the original all-types behaviour. Each mapped group is set to its EFFECTIVE
+    level — the highest any of its personas grants (personas stack).
     """
     # Validate persona exists
     persona_def = session.exec(
@@ -1503,13 +1852,28 @@ def apply_permissions(
         requested_set = set(requested_types)
         templates = [t for t in templates if t.resource_type in requested_set]
 
-    # Access is group-membership-based. A user who belongs to groups mapped to
-    # several personas is resolved by Databricks ITSELF to the UNION (max) of
-    # those groups' ACLs at access time. The app therefore must NOT rewrite one
-    # group's level based on another persona a member happens to also belong to —
-    # doing so over-grants every member who is only in this group (privilege
-    # escalation). Each mapped group receives strictly ITS OWN persona's template
-    # level for the resource type; no cross-persona "conflict resolution" here.
+    # Personas STACK (see persona_sync). Each mapped group's level on an object
+    # is the HIGHEST its own personas (and, for Genie, applied bundles) grant
+    # there. Every member of the group holds all of the GROUP's personas, so this
+    # never over-grants anyone; the app still never raises a group because of
+    # personas its MEMBERS hold via OTHER groups (Databricks unions those at
+    # access time). A persona's NO_PERMISSIONS grants nothing: a group's entry is
+    # removed only when no source grants anything, so applying this persona never
+    # strips access another persona of the same group grants. Groups are looked
+    # up by id; a deleted group is skipped (never re-granted by name).
+    groups = resolve_groups(obo_ws, mappings)
+    live = {gid: r for gid, r in groups.items() if not r.missing}
+    missing_errors = [
+        f"Group id {r.group_id} ('{r.stored_name}') no longer exists; it was skipped."
+        for r in groups.values()
+        if r.missing
+    ]
+    _persist_group_renames(session, live)
+    personas_of = personas_by_group(session, live)
+    cells = load_cells(session, {persona, *(p for ps in personas_of.values() for p in ps)})
+    table_added = table_revoked = 0
+    table_errors: list[str] = []
+    warnings: list[str] = list(missing_errors)
     results = []
     total_updated = 0
     total_errors = 0
@@ -1580,12 +1944,11 @@ def apply_permissions(
             total_errors += 1
             continue
 
-        # The managed groups for this persona are all set to this persona's own
-        # level. NO_PERMISSIONS means "revoke" — the merge helper removes the
-        # group from each resource's ACL. When the persona has no mapped groups
-        # (direct-only persona), skip the group ACL loop entirely.
-        group_levels = {m.group_name: level for m in mappings}
-        if not group_levels:
+        # Every mapped group is set to its EFFECTIVE level across ALL of its
+        # personas (NO_PERMISSIONS = nothing grants it -> the merge helper
+        # removes the group's entry). When the persona has no (live) mapped
+        # groups (direct-only persona), skip the group ACL loop entirely.
+        if not live:
             results.append(
                 ApplyResultOut(
                     persona=persona,
@@ -1596,25 +1959,21 @@ def apply_permissions(
             )
             continue
 
-        resources = list_resources(obo_ws, template.resource_type)
-        resource_errors: list[str] = []
-        updated = 0
-
-        for resource in resources:
-            try:
-                # Read-modify-write MERGE: only the persona's groups are changed;
-                # existing users, owners, admins, and other groups are preserved.
-                apply_group_acl(
-                    obo_ws,
-                    template.resource_type,
-                    resource.id,
-                    group_levels,
-                )
-                updated += 1
-            except Exception as e:
-                error_msg = f"Failed to set permissions on {resource.name} ({resource.id}): {str(e)}"
-                logger.error(error_msg)
-                resource_errors.append(error_msg)
+        if template.resource_type == GENIE:
+            # Per space (overrides), and Genie access always comes WITH the
+            # table grants the space needs.
+            genie = _apply_genie(obo_ws, session, live, actor)
+            updated, resource_errors = genie.updated, genie.errors
+            table_added += genie.added
+            table_revoked += genie.revoked
+            table_errors.extend(e for e in genie.errors)
+            warnings.extend(genie.warnings)
+        else:
+            updated, resource_errors = _apply_type(
+                obo_ws,
+                template.resource_type,
+                _group_levels(live, personas_of, cells, template.resource_type),
+            )
 
         total_updated += updated
         total_errors += len(resource_errors)
@@ -1650,8 +2009,12 @@ def apply_permissions(
         persona=persona,
         results=results,
         total_resources_updated=total_updated,
-        total_errors=total_errors,
+        total_errors=total_errors + len(missing_errors),
         direct_users_synced=direct_users_synced,
+        table_grants_added=table_added,
+        table_grants_revoked=table_revoked,
+        table_grant_errors=table_errors,
+        warnings=warnings,
     )
 
 

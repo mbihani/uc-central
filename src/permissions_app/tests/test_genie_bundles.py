@@ -637,6 +637,7 @@ def test_ledger_migration_is_idempotent_on_fresh_db():
         ensure_genie_bundle_schema(conn)
     with Session(engine) as s:
         row = dict(
+            source="bundle:1",
             bundle_id=1,
             group_id="g-1",
             space_id="s",
@@ -652,7 +653,7 @@ def test_ledger_migration_is_idempotent_on_fresh_db():
         assert len(s.exec(select(GenieGrantLedger)).all()) == 1
         s.add(GenieGrantLedger(**row))
         with pytest.raises(IntegrityError):
-            s.commit()  # (bundle, principal, securable, privilege) is UNIQUE
+            s.commit()  # (source, group_id, securable, privilege) is UNIQUE
     engine.dispose()
 
 
@@ -935,6 +936,7 @@ def test_failed_grant_does_not_leave_a_pending_row(fixture_space, session):
 def test_only_the_expected_unique_conflict_is_tolerated(session):
     bundle = _bundle(session)
     row = dict(
+        source=f"bundle:{bundle.id}",
         bundle_id=bundle.id,
         group_id="g-1",
         space_id=SPACE_ID,
@@ -1640,7 +1642,7 @@ def test_fresh_and_already_migrated_dbs_stay_idempotent(kind, tmp_path):
         s.commit()
         s.add(
             GenieGrantLedger(
-                bundle_id=b.id or 0, group_id="g-1", space_id="space-a", principal=GROUP,
+                source=f"bundle:{b.id}", bundle_id=b.id or 0, group_id="g-1", space_id="space-a", principal=GROUP,
                 securable_type="table", full_name="c.s.t", privilege="SELECT",
             )
         )
@@ -1657,7 +1659,7 @@ def test_fresh_and_already_migrated_dbs_stay_idempotent(kind, tmp_path):
 
 def _ledger_kwargs(**over):
     base = dict(
-        bundle_id=1, space_id="s", principal=GROUP, securable_type="table",
+        source="bundle:1", bundle_id=1, space_id="s", principal=GROUP, securable_type="table",
         full_name="c.s.t", privilege="SELECT",
     )
     base.update(over)

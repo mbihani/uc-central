@@ -38,6 +38,7 @@ from sqlmodel import Session, select, text
 
 from .logger import logger
 from .models import (
+    GENIE_LEDGER_SOURCE_UNIQUE,
     LEDGER_CONFIRMED,
     LEDGER_PENDING,
     GenieAccessBundle,
@@ -91,6 +92,124 @@ class GrantKey:
     securable_type: str
     full_name: str
     privilege: str
+
+
+BUNDLE_SOURCE_PREFIX = "bundle:"
+PERSONA_SOURCE_PREFIX = "persona:"
+
+
+@dataclass(frozen=True)
+class GrantSource:
+    """WHY a set of UC grants is needed — the unit of ledger refcounting.
+
+    ``bundle:<id>`` for a Genie access bundle, ``persona:<key>:space:<id>`` for
+    a persona whose Genie level on that space reaches the table-grant
+    threshold for a group. Two sources for the same group id can rely on the
+    same grant; it is only revoked when the LAST source releases it (and only
+    if the app created it).
+    """
+
+    key: str
+    group_id: str
+    space_id: str
+    bundle_id: int | None = None
+    persona: str | None = None
+
+    @classmethod
+    def for_bundle(cls, bundle: GenieAccessBundle) -> "GrantSource":
+        return cls(
+            key=f"{BUNDLE_SOURCE_PREFIX}{bundle.id or 0}",
+            group_id=bundle.group_id,
+            space_id=bundle.space_id,
+            bundle_id=bundle.id,
+        )
+
+    @classmethod
+    def for_persona(cls, persona: str, group_id: str, space_id: str) -> "GrantSource":
+        return cls(
+            key=f"{PERSONA_SOURCE_PREFIX}{persona}:space:{space_id}",
+            group_id=group_id,
+            space_id=space_id,
+            persona=persona,
+        )
+
+
+def _as_source(owner: "GenieAccessBundle | GrantSource") -> GrantSource:
+    return owner if isinstance(owner, GrantSource) else GrantSource.for_bundle(owner)
+
+
+def describe_source(source_key: str) -> str:
+    if source_key.startswith(BUNDLE_SOURCE_PREFIX):
+        return f"bundle {source_key[len(BUNDLE_SOURCE_PREFIX):]}"
+    if source_key.startswith(PERSONA_SOURCE_PREFIX):
+        persona, _, space = source_key[len(PERSONA_SOURCE_PREFIX):].partition(":space:")
+        return f"persona '{persona}' (space {space})"
+    return source_key
+
+
+@dataclass
+class SpaceDiscovery:
+    """A Genie space's data sources, resolved — shared by bundles and personas."""
+
+    space_id: str
+    title: str = ""
+    warehouse_id: str | None = None
+    objects: list[GenieSpaceObjectOut] = field(default_factory=list)
+    # Non-empty => nothing may be granted for this space (and no access that
+    # would need table grants may be given).
+    blockers: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def table_keys(self) -> list[GrantKey]:
+        """UC grants the space needs (parents first), WITHOUT the space ACL."""
+        return [k for k in required_grants(self.space_id, self.objects) if k.securable_type != GENIE_SPACE]
+
+
+def discover_space(ws: WorkspaceClient, space_id: str, fallback_title: str = "") -> SpaceDiscovery:
+    """Read a space's definition and resolve its data sources. Read-only."""
+    d = SpaceDiscovery(space_id=space_id, title=fallback_title)
+    serialized: str | None = None
+    try:
+        space = ws.genie.get_space(space_id, include_serialized_space=True)
+        d.title = space.title or fallback_title
+        d.warehouse_id = space.warehouse_id
+        serialized = space.serialized_space
+        refs = parse_serialized_space(serialized)
+        space_read = True
+    except ValueError as e:
+        d.blockers.append(f"Could not parse the Genie space definition: {e}")
+        refs, space_read = [], False
+    except PermissionDenied:
+        d.blockers.append(
+            f"The app service principal cannot read Genie space '{space_id}' "
+            f"(it needs CAN_MANAGE on the space to read its definition and set its ACL)."
+        )
+        refs, space_read = [], False
+    except NotFound:
+        d.blockers.append(f"Genie space '{space_id}' was not found.")
+        refs, space_read = [], False
+
+    d.objects = resolve_objects(ws, refs)
+    if space_read and not any(o.resolved for o in d.objects):
+        # CAN_RUN on a space whose tables the group cannot read is useless, and
+        # an empty plan usually means the definition format was not understood.
+        if not serialized:
+            reason = "the space definition (serialized_space) was not returned"
+        elif not refs:
+            reason = (
+                "no data sources were found (data_sources is absent or empty, or "
+                "the definition format is not recognized)"
+            )
+        else:
+            reason = "none of the space's data sources could be resolved"
+        d.blockers.append(f"Nothing to grant: {reason}.")
+    for o in d.objects:
+        if not o.resolved:
+            d.warnings.append(
+                f"Data source '{o.identifier}' could not be resolved and will NOT "
+                f"be granted: {o.reason}"
+            )
+    return d
 
 
 @dataclass
@@ -663,7 +782,7 @@ def _grant_lock(session: Session, group_id: str, key: GrantKey) -> Iterator[None
 
 # ─── Ledger helpers ──────────────────────────────────────────────────────────
 
-LEDGER_UNIQUE = "uq_genie_grant_ledger_bundle_grant"
+LEDGER_UNIQUE = GENIE_LEDGER_SOURCE_UNIQUE
 
 
 def is_unique_violation(exc: IntegrityError, constraint: str, table: str) -> bool:
@@ -684,14 +803,18 @@ def _key_of(row: GenieGrantLedger) -> GrantKey:
     return GrantKey(row.securable_type, row.full_name, row.privilege)
 
 
-def _ledger_for_bundle(session: Session, bundle_id: int) -> list[GenieGrantLedger]:
+def _ledger_for_source(session: Session, source_key: str) -> list[GenieGrantLedger]:
     return list(
         session.exec(
             select(GenieGrantLedger)
-            .where(GenieGrantLedger.bundle_id == bundle_id)
+            .where(GenieGrantLedger.source == source_key)
             .execution_options(populate_existing=True)
         ).all()
     )
+
+
+def _ledger_for_bundle(session: Session, bundle_id: int) -> list[GenieGrantLedger]:
+    return _ledger_for_source(session, f"{BUNDLE_SOURCE_PREFIX}{bundle_id}")
 
 
 def _ledger_for_group(session: Session, group_id: str) -> list[GenieGrantLedger]:
@@ -724,10 +847,10 @@ def _ledger_for_grant(
 
 
 def _own_row(
-    session: Session, bundle_id: int, group_id: str, key: GrantKey
+    session: Session, source_key: str, group_id: str, key: GrantKey
 ) -> GenieGrantLedger | None:
     return next(
-        (r for r in _ledger_for_grant(session, group_id, key) if r.bundle_id == bundle_id),
+        (r for r in _ledger_for_grant(session, group_id, key) if r.source == source_key),
         None,
     )
 
@@ -821,47 +944,12 @@ def build_plan(
             f"on the next apply / resync / delete / membership change."
         )
 
-    serialized: str | None = None
-    try:
-        space = ws.genie.get_space(bundle.space_id, include_serialized_space=True)
-        plan.space_title = space.title or bundle.space_title
-        plan.warehouse_id = space.warehouse_id
-        serialized = space.serialized_space
-        refs = parse_serialized_space(serialized)
-        space_read = True
-    except ValueError as e:
-        plan.blockers.append(f"Could not parse the Genie space definition: {e}")
-        refs, space_read = [], False
-    except PermissionDenied:
-        plan.blockers.append(
-            f"The app service principal cannot read Genie space '{bundle.space_id}' "
-            f"(it needs CAN_MANAGE on the space to read its definition and set its ACL)."
-        )
-        refs, space_read = [], False
-    except NotFound:
-        plan.blockers.append(f"Genie space '{bundle.space_id}' was not found.")
-        refs, space_read = [], False
-
-    plan.objects = resolve_objects(ws, refs)
-    if space_read and not any(o.resolved for o in plan.objects):
-        # CAN_RUN on a space whose tables the group cannot read is useless, and
-        # an empty plan usually means the definition format was not understood.
-        if not serialized:
-            reason = "the space definition (serialized_space) was not returned"
-        elif not refs:
-            reason = (
-                "no data sources were found (data_sources is absent or empty, or "
-                "the definition format is not recognized)"
-            )
-        else:
-            reason = "none of the space's data sources could be resolved"
-        plan.blockers.append(f"Nothing to grant: {reason}.")
-    for o in plan.objects:
-        if not o.resolved:
-            plan.warnings.append(
-                f"Data source '{o.identifier}' could not be resolved and will NOT "
-                f"be granted: {o.reason}"
-            )
+    discovery = discover_space(ws, bundle.space_id, bundle.space_title)
+    plan.space_title = discovery.title
+    plan.warehouse_id = discovery.warehouse_id
+    plan.objects = discovery.objects
+    plan.blockers.extend(discovery.blockers)
+    plan.warnings.extend(discovery.warnings)
     restricted = [o.full_name for o in plan.objects if o.has_row_filter or o.masked_columns]
     if restricted:
         plan.warnings.append(
@@ -874,14 +962,17 @@ def build_plan(
             f"The space runs on SQL warehouse '{plan.warehouse_id}'. Warehouse "
             f"access is not managed by the bundle."
         )
+    # By group ID (never by display name): personas mapped to this same group.
     mapped = session.exec(
-        select(PersonaGroupMapping).where(PersonaGroupMapping.group_name == principal)
-    ).first()
+        select(PersonaGroupMapping).where(PersonaGroupMapping.group_id == bundle.group_id)
+    ).all()
     if mapped:
+        names = ", ".join(sorted({m.persona for m in mapped}))
         plan.warnings.append(
-            f"'{principal}' is also mapped to persona '{mapped.persona}'. "
-            f"Applying that persona rewrites this group's Genie-space ACL; use a "
-            f"dedicated group for the bundle."
+            f"'{principal}' is also mapped to persona(s) {names}. They stack with this "
+            f"bundle: persona Apply keeps the group's Genie level on this space at the "
+            f"highest of the personas and this bundle, and shared table grants are "
+            f"only revoked when no persona or bundle still needs them."
         )
 
     required = required_grants(bundle.space_id, plan.objects)
@@ -954,7 +1045,7 @@ def _grant(ws: WorkspaceClient, principal: str, key: GrantKey) -> None:
 def reconcile_pending(
     ws: WorkspaceClient,
     session: Session,
-    bundle: GenieAccessBundle,
+    owner: "GenieAccessBundle | GrantSource",
     result: GenieBundleActionOut,
 ) -> None:
     """Resolve PENDING rows left behind by an apply that died mid-grant.
@@ -977,17 +1068,18 @@ def reconcile_pending(
         apply that follows grants it normally).
       * workspace unreadable -> leave it pending and report the error.
     """
-    for row in _ledger_for_bundle(session, bundle.id or 0):
+    source = _as_source(owner)
+    for row in _ledger_for_source(session, source.key):
         if row.state != LEDGER_PENDING:
             continue
         key = _key_of(row)
         try:
-            with _grant_lock(session, bundle.group_id, key):
-                own = _own_row(session, bundle.id or 0, bundle.group_id, key)
+            with _grant_lock(session, source.group_id, key):
+                own = _own_row(session, source.key, source.group_id, key)
                 if own is None or own.state != LEDGER_PENDING:
                     session.commit()
                     continue
-                principal = _current_principal(ws, bundle.group_id)
+                principal = _current_principal(ws, source.group_id)
                 own.principal = principal
                 present, _ = _is_present(ws, principal, key)
                 if present:
@@ -1041,18 +1133,42 @@ def apply_plan(
         warnings=list(plan.warnings),
     )
     assert plan.group is not None and not plan.group.error
-    gid = bundle.group_id
-    bundle_id = bundle.id or 0
+    apply_source_grants(ws, session, GrantSource.for_bundle(bundle), plan.evaluated, actor, result)
 
-    reconcile_pending(ws, session, bundle, result)
+    if revoke_stale:
+        _release_rows(ws, session, plan.stale_rows, result)
 
-    for ev in plan.evaluated:
+    _finish(result)
+    return result
+
+
+def apply_source_grants(
+    ws: WorkspaceClient,
+    session: Session,
+    source: GrantSource,
+    evaluated: list[_Evaluated],
+    actor: str,
+    result: GenieBundleActionOut,
+) -> None:
+    """Grant each missing key for ``source`` and record every key it needs.
+
+    The shared grant engine for bundles AND persona-driven table grants. Each
+    grant runs under ONE continuous per-grant lock span (keyed on the group
+    id): fresh presence check -> durable PENDING row (committed) -> workspace
+    grant -> CONFIRMED (``app_granted=True``) or rolled back. Pending rows from
+    an earlier crash are reconciled first. Already-effective privileges are
+    recorded as needed (``app_granted=False``) and never revoked.
+    """
+    gid = source.group_id
+    reconcile_pending(ws, session, source, result)
+
+    for ev in evaluated:
         if ev.status == "error":
             result.errors.append(ev.detail or f"Could not evaluate {ev.key}.")
             continue
         key = ev.key
         with _grant_lock(session, gid, key):
-            own = _own_row(session, bundle_id, gid, key)
+            own = _own_row(session, source.key, gid, key)
             try:
                 # Resolved by id UNDER the lock: the name UC calls must use now.
                 principal = _current_principal(ws, gid)
@@ -1064,7 +1180,7 @@ def apply_plan(
                 # Already effective: record that this bundle relies on it,
                 # without taking ownership — only app-issued grants are revoked.
                 if own is None:
-                    session.add(_new_row(bundle, principal, key, actor, app_granted=False))
+                    session.add(_new_row(source, principal, key, actor, app_granted=False))
                     result.adopted.append(_grant_out(key, ev.status, detail))
                 _commit(session)
                 continue
@@ -1073,7 +1189,7 @@ def apply_plan(
             if own is None:
                 # app_granted stays False until the grant is CONFIRMED below, so
                 # a crash can never leave an unproven row marked app-granted.
-                own = _new_row(bundle, principal, key, actor, app_granted=False)
+                own = _new_row(source, principal, key, actor, app_granted=False)
             own.state = LEDGER_PENDING
             own.principal = principal
             session.add(own)
@@ -1096,7 +1212,7 @@ def apply_plan(
                 principal = _current_principal(ws, gid)
                 _grant(ws, principal, key)
             except UCGrantError as e:
-                logger.error(f"Genie bundle {bundle_id}: {e}")
+                logger.error(f"Grant source {source.key}: {e}")
                 granted_error = e
 
             row = session.get(GenieGrantLedger, row_id, populate_existing=True)
@@ -1117,12 +1233,6 @@ def apply_plan(
         else:
             result.errors.append(str(granted_error))
 
-    if revoke_stale:
-        _release_rows(ws, session, plan.stale_rows, result)
-
-    _finish(result)
-    return result
-
 
 def _after_pending_commit(key: GrantKey) -> None:
     """No-op seam: called right after a pending row is committed and before the
@@ -1130,14 +1240,24 @@ def _after_pending_commit(key: GrantKey) -> None:
 
 
 def _new_row(
-    bundle: GenieAccessBundle, principal: str, key: GrantKey, actor: str, *, app_granted: bool
+    owner: "GenieAccessBundle | GrantSource",
+    principal: str,
+    key: GrantKey,
+    actor: str,
+    *,
+    app_granted: bool,
 ) -> GenieGrantLedger:
-    if not bundle.group_id:
-        raise RuntimeError(f"Bundle {bundle.id} has no group id; refusing to write a ledger row.")
+    source = _as_source(owner)
+    if not source.group_id:
+        raise RuntimeError(
+            f"Grant source {source.key} has no group id; refusing to write a ledger row."
+        )
     return GenieGrantLedger(
-        bundle_id=bundle.id or 0,
-        group_id=bundle.group_id,
-        space_id=bundle.space_id,
+        source=source.key,
+        bundle_id=source.bundle_id,
+        persona=source.persona,
+        group_id=source.group_id,
+        space_id=source.space_id,
         principal=principal,
         securable_type=key.securable_type,
         full_name=key.full_name,
@@ -1151,9 +1271,23 @@ def _new_row(
 # ─── Release (revoke) ────────────────────────────────────────────────────────
 
 
-def _revoke(ws: WorkspaceClient, principal: str, key: GrantKey, result: GenieBundleActionOut) -> None:
-    """Targeted revoke of one app-issued privilege. Raises UCGrantError."""
+def _revoke(
+    ws: WorkspaceClient,
+    session: Session,
+    group_id: str,
+    principal: str,
+    key: GrantKey,
+    result: GenieBundleActionOut,
+) -> None:
+    """Targeted revoke of one app-issued privilege. Raises UCGrantError.
+
+    For a bundle's space ACL entry, personas of the same group still count: if
+    any of them grants the space, the entry is set to the personas' highest
+    level instead of being removed (stacked sources never strip each other).
+    """
     if key.securable_type == GENIE_SPACE:
+        from .persona_sync import persona_space_level  # avoid an import cycle
+
         try:
             level = _space_direct_level(ws, key.full_name, principal)
             if level is None:
@@ -1164,6 +1298,17 @@ def _revoke(ws: WorkspaceClient, principal: str, key: GrantKey, result: GenieBun
                 result.warnings.append(
                     f"'{principal}' now holds {level} on Genie space "
                     f"'{key.full_name}' (not the app-granted {key.privilege}); left in place."
+                )
+                return
+            remaining, personas = persona_space_level(session, group_id, key.full_name)
+            if remaining != PermissionLevel.NO_PERMISSIONS.value:
+                if remaining != level:
+                    apply_group_acl(
+                        ws, ResourceType.GENIE_SPACES.value, key.full_name, {principal: remaining}
+                    )
+                result.warnings.append(
+                    f"'{principal}' keeps {remaining} on Genie space '{key.full_name}' "
+                    f"from persona(s) {', '.join(personas)}."
                 )
                 return
             apply_group_acl(
@@ -1195,7 +1340,7 @@ def _release_rows(
     result: GenieBundleActionOut,
 ) -> None:
     """Drop ledger rows, revoking a privilege only when the app granted it and
-    no other bundle still relies on it.
+    no other SOURCE (bundle or persona) of the same group still relies on it.
 
     The decision for each grant is ATOMIC under its per-grant lock: re-read the
     other bundles' rows, drop this row, and revoke (if this was the last
@@ -1204,16 +1349,17 @@ def _release_rows(
     PENDING row from another bundle counts as "still needed". A row whose revoke
     fails is KEPT (the transaction rolls back) so the operation can be retried.
     """
-    plan = [(r.id, r.bundle_id, r.group_id, _key_of(r)) for r in rows]
+    plan = [(r.id, r.source, r.group_id, _key_of(r)) for r in rows]
     plan.sort(key=lambda t: -_TYPE_ORDER.get(t[3].securable_type, 9))
-    for row_id, bundle_id, gid, key in plan:
+    for row_id, source_key, gid, key in plan:
         with _grant_lock(session, gid, key):
             row = session.get(GenieGrantLedger, row_id, populate_existing=True)
             if row is None:
                 session.commit()
                 continue
-            # "Still needed" is decided by group ID, never by display name.
-            others = [r for r in _ledger_for_grant(session, gid, key) if r.bundle_id != bundle_id]
+            # "Still needed" is decided by group ID (never by display name),
+            # across every OTHER source — bundles and personas alike.
+            others = [r for r in _ledger_for_grant(session, gid, key) if r.source != source_key]
             if others:
                 if row.app_granted and not any(o.app_granted for o in others):
                     # Hand ownership of the app-issued grant to a remaining bundle.
@@ -1222,15 +1368,15 @@ def _release_rows(
                 session.delete(row)
                 session.commit()
                 result.released.append(
-                    _grant_out(key, "released", f"still needed by bundle {others[0].bundle_id}")
+                    _grant_out(key, "released", f"still needed by {describe_source(others[0].source)}")
                 )
                 continue
             if row.app_granted:
                 try:
                     # Resolved by id UNDER the lock — never the stored name.
-                    _revoke(ws, _current_principal(ws, gid), key, result)
+                    _revoke(ws, session, gid, _current_principal(ws, gid), key, result)
                 except UCGrantError as e:
-                    logger.error(f"Genie bundle {bundle_id}: {e}")
+                    logger.error(f"Grant source {source_key}: {e}")
                     result.errors.append(str(e))
                     session.rollback()
                     continue
